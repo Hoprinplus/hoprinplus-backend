@@ -1,91 +1,101 @@
-// --- Hoprin+ Backend Server (Versión Robusta para Despliegue) ---
-console.log("Iniciando script del servidor...");
+console.log("Iniciando script del servidor con Baileys...");
 
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
-const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 
 // --- Configuración del Servidor ---
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: {
-        origin: "*", 
-        methods: ["GET", "POST"]
-    }
+    cors: { origin: "*", methods: ["GET", "POST"] }
 });
-
-// Render asigna el puerto dinámicamente. Esta es la forma correcta de usarlo.
 const PORT = process.env.PORT || 3001;
 
-// --- Inicialización del Cliente de WhatsApp ---
-console.log('Inicializando cliente de WhatsApp...');
-const client = new Client({
-    authStrategy: new LocalAuth({
-        dataPath: './.wwebjs_auth' // Especificamos una ruta para la sesión
-    }),
-    puppeteer: {
-        headless: true,
-        // **LA CORRECCIÓN MÁS IMPORTANTE ESTÁ AQUÍ**
-        // Estos argumentos son cruciales para que Chrome/Puppeteer funcione en entornos de servidor como Render.
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--single-process', // <- este puede no ser necesario, pero ayuda en entornos con poca memoria
-            '--disable-gpu'
-        ],
-    }
-});
+let sock;
+let qrCodeUrl = '';
 
-// --- Eventos del Cliente de WhatsApp ---
-client.on('qr', async (qr) => {
-    console.log('Evento QR recibido. Generando Data URL...');
-    const qrDataURL = await qrcode.toDataURL(qr);
-    console.log('QR generado. Enviando al frontend.');
-    io.emit('qr', qrDataURL);
-});
+async function connectToWhatsApp() {
+    console.log('Iniciando conexión con WhatsApp...');
+    const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    console.log(`Usando Baileys v${version.join('.')}, es la última versión: ${isLatest}`);
 
-client.on('ready', () => {
-    console.log('¡Cliente de WhatsApp está listo y conectado!');
-    io.emit('status', 'Conectado exitosamente a WhatsApp.');
-});
+    sock = makeWASocket({
+        version,
+        printQRInTerminal: true,
+        auth: state,
+        browser: ['Hoprin+', 'Chrome', '1.0.0'],
+    });
 
-client.on('message', async (message) => {
-    console.log(`Nuevo mensaje de: ${message.from}`);
-    const contact = await message.getContact();
-    const messageData = {
-        from: message.from,
-        body: message.body,
-        contact: { name: contact.name || contact.pushname }
-    };
-    io.emit('nuevo_mensaje', messageData);
-});
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        if (qr) {
+            console.log('QR recibido, enviando al frontend...');
+            qrCodeUrl = await qrcode.toDataURL(qr);
+            io.emit('qr', qrCodeUrl);
+        }
+        if (connection === 'close') {
+            const shouldReconnect = (lastDisconnect.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+            console.log('Conexión cerrada, motivo:', lastDisconnect.error, ', reconectando:', shouldReconnect);
+            if (shouldReconnect) {
+                connectToWhatsApp();
+            }
+        } else if (connection === 'open') {
+            console.log('¡Conexión con WhatsApp abierta!');
+            io.emit('status', 'Conectado exitosamente a WhatsApp.');
+        }
+    });
 
-client.on('disconnected', (reason) => {
-    console.log('Cliente de WhatsApp fue desconectado.', reason);
-    io.emit('status', 'Desconectado de WhatsApp.');
-    client.initialize();
-});
+    sock.ev.on('messages.upsert', async (m) => {
+        const msg = m.messages[0];
+        if (!msg.message) return;
 
-console.log('A punto de llamar a client.initialize()...');
-client.initialize().catch(err => console.error('Fallo al inicializar el cliente:', err));
+        const sender = msg.key.remoteJid;
+        const messageText = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+        console.log(`Nuevo mensaje de ${sender}: ${messageText}`);
 
+        // TODO: Lógica de negocio
+        const messageData = {
+            from: sender,
+            body: messageText,
+            contact: { name: msg.pushName || sender }
+        };
+        io.emit('nuevo_mensaje', messageData);
+    });
+    
+    sock.ev.on('creds.update', saveCreds);
+}
 
 // --- Eventos de Socket.IO ---
 io.on('connection', (socket) => {
     console.log(`Un usuario frontend se ha conectado: ${socket.id}`);
+    if (qrCodeUrl) {
+        socket.emit('qr', qrCodeUrl);
+    }
+    socket.on('enviar_mensaje', async ({ to, message }) => {
+        try {
+            if (sock && sock.user) {
+                console.log(`Enviando mensaje a ${to}: ${message}`);
+                await sock.sendMessage(to, { text: message });
+            } else {
+                throw new Error('WhatsApp no está conectado.');
+            }
+        } catch (err) {
+            console.error('Error al enviar mensaje:', err);
+            socket.emit('envio_error', { to, error: 'No se pudo enviar el mensaje.' });
+        }
+    });
     socket.on('disconnect', () => {
         console.log(`Usuario frontend desconectado: ${socket.id}`);
     });
 });
 
-// --- Iniciar el Servidor ---
+// --- Iniciar el Servidor y la Conexión ---
 server.listen(PORT, () => {
     console.log(`Servidor Hoprin+ iniciado y escuchando en el puerto ${PORT}`);
+    connectToWhatsApp().catch(err => console.log("Error inesperado al iniciar:", err));
 });
