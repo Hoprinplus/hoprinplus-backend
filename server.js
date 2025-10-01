@@ -16,6 +16,7 @@ const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 const { getStorage, ref, uploadBytes, getDownloadURL } = require("firebase-admin/storage");
 const NodeWebSocket = require('ws');
+const { Telegraf } = require('telegraf');
 
 // --- Configuración de Firebase ---
 const serviceAccount = require('./serviceAccountKey.json');
@@ -39,6 +40,74 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 
 const whatsappClients = {};
 const qrCodes = {};
 const qrTimeouts = {};
+
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+
+if (TELEGRAM_BOT_TOKEN) {
+    const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
+
+    bot.on('text', async (ctx) => {
+        const message = ctx.message;
+        const from = message.from;
+        
+        console.log(`[TELEGRAM] Mensaje recibido de ${from.first_name} (ID: ${from.id})`);
+
+        const contactId = from.id.toString();
+        const pushName = from.first_name ? `${from.first_name} ${from.last_name || ''}`.trim() : from.username;
+        const messageText = message.text;
+
+        const chatsRef = db.collection('chats');
+        // Buscamos un chat existente por ID de Telegram y plataforma
+        const chatQuery = await chatsRef.where('contactId', '==', contactId).where('platform', '==', 'telegram').limit(1).get();
+        
+        let chatDocRef;
+
+        if (chatQuery.empty) {
+            console.log(`[TELEGRAM] Creando nuevo chat para el contacto: ${pushName}`);
+            // --- Lógica para asignar departamento a nuevos chats de Telegram ---
+            // Por ahora, se asignará a Atención al Cliente. Puedes cambiarlo si es necesario.
+            const atencionDeptQuery = await db.collection('departments').where('name', '==', 'Atencion al Cliente').limit(1).get();
+            const atencionDeptId = atencionDeptQuery.empty ? null : atencionDeptQuery.docs[0].id;
+
+            const newChatData = {
+                contactName: pushName,
+                contactId: contactId, // ID de Telegram
+                platform: 'telegram', // Plataforma
+                internalId: `TG-${Date.now().toString().slice(-6)}`,
+                departmentIds: atencionDeptId ? [atencionDeptId] : [],
+                status: 'Abierto',
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                lastMessage: messageText,
+                lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+                agentEmail: null,
+                isBotActive: false, // El bot aún no está implementado para Telegram
+            };
+            chatDocRef = await chatsRef.add(newChatData);
+        } else {
+            console.log(`[TELEGRAM] Actualizando chat existente para: ${pushName}`);
+            chatDocRef = chatQuery.docs[0].ref;
+            await chatDocRef.update({
+                status: 'Abierto',
+                lastMessage: messageText,
+                lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp()
+            });
+        }
+
+        // Guardar el mensaje en la subcolección
+        await db.collection('chats').doc(chatDocRef.id).collection('messages').add({
+            text: messageText,
+            sender: 'contact',
+            timestamp: admin.firestore.FieldValue.serverTimestamp(),
+            telegramMessageId: message.message_id
+        });
+    });
+
+    bot.launch();
+    console.log("[TELEGRAM] Conector de Telegram iniciado y escuchando mensajes.");
+
+} else {
+    console.warn("[TELEGRAM] Token no encontrado. El conector de Telegram no se iniciará.");
+}
 
 // --- LÓGICA DE HORARIOS DE OFICINA Y MENSAJES AUTOMÁTICOS ---
 let botSettings = { isEnabled: true, awayMessage: 'Gracias por escribirnos. Nuestro horario de atención ha finalizado por hoy. Te responderemos tan pronto como nuestro equipo esté de vuelta.', schedule: [], welcomeEnabled: false, welcomeMessage: '', closingEnabled: false, closingMessage: '', closingDelay: '10' };
