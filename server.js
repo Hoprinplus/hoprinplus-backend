@@ -63,11 +63,21 @@ if (TELEGRAM_BOT_TOKEN) {
         let chatDocRef;
 
         if (chatQuery.empty) {
-            console.log(`[TELEGRAM] Creando nuevo chat para el contacto: ${pushName}`);
-            // --- Lógica para asignar departamento a nuevos chats de Telegram ---
-            // Por ahora, se asignará a Atención al Cliente. Puedes cambiarlo si es necesario.
-            const atencionDeptQuery = await db.collection('departments').where('name', '==', 'Atencion al Cliente').limit(1).get();
-            const atencionDeptId = atencionDeptQuery.empty ? null : atencionDeptQuery.docs[0].id;
+           console.log(`[TELEGRAM] Creando nuevo chat para el contacto: ${pushName}`);
+    
+    // --- LÓGICA REFORZADA: Asignar SIEMPRE a Atención al Cliente ---
+    let atencionDeptId = null;
+    try {
+        const deptQuery = await db.collection('departments').where('name', '==', 'Atencion al Cliente').limit(1).get();
+        if (!deptQuery.empty) {
+            atencionDeptId = deptQuery.docs[0].id;
+            console.log(`[TELEGRAM] Departamento 'Atencion al Cliente' encontrado con ID: ${atencionDeptId}`);
+        } else {
+            console.warn("[TELEGRAM] ¡Alerta! El departamento 'Atencion al Cliente' no se encontró en la base de datos.");
+        }
+    } catch (error) {
+        console.error("[TELEGRAM] Error al buscar el departamento 'Atencion al Cliente':", error);
+    }
 
             const newChatData = {
                 contactName: pushName,
@@ -524,46 +534,81 @@ io.on('connection', (socket) => {
         io.emit('status_update', { channelId, status: 'Desconectado' });
     });
 
-    socket.on('enviar_mensaje', async ({ chatId, message, agentEmail, fileUrl, fileType, fileName }) => {
-        try {
-            const chatRef = db.collection('chats').doc(chatId);
-            const chatDoc = await chatRef.get();
-            if (!chatDoc.exists) throw new Error(`Chat ${chatId} no existe.`);
-
-            const { contactPhone, departmentId } = chatDoc.data();
-            const client = Object.values(whatsappClients).find(c => c.departmentId === departmentId);
-            if (!client) throw new Error(`No hay canal conectado para el departamento ${departmentId}`);
-
-            let sentMsg;
-            let messageData;
-            let lastMessageText = message;
-
-            if (fileUrl) {
-                const messageOptions = { caption: message || '' };
-                if (fileType.startsWith('image/')) {
-                    messageOptions.image = { url: fileUrl };
-                    lastMessageText = message || '📷 Imagen';
-                } else {
-                    messageOptions.document = { url: fileUrl };
-                    messageOptions.mimetype = fileType;
-                    messageOptions.fileName = fileName || 'Documento';
-                    lastMessageText = fileName;
-                }
-                sentMsg = await client.sock.sendMessage(contactPhone, messageOptions);
-                messageData = { text: message, fileUrl, fileType, fileName, sender: 'agent', senderEmail: agentEmail, timestamp: admin.firestore.FieldValue.serverTimestamp(), status: 'sent', whatsappMessageId: sentMsg.key.id };
-            } else {
-                sentMsg = await client.sock.sendMessage(contactPhone, { text: message });
-                messageData = { text: message, sender: 'agent', senderEmail: agentEmail, timestamp: admin.firestore.FieldValue.serverTimestamp(), status: 'sent', whatsappMessageId: sentMsg.key.id };
-            }
-
-            await chatRef.collection('messages').add(messageData);
-            await chatRef.update({ lastMessage: lastMessageText, lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(), agentEmail, isBotActive: false });
-
-        } catch (err) {
-            console.error('Error al enviar mensaje:', err.message);
-            socket.emit('envio_fallido', { chatId: chatId, error: err.message });
+socket.on('enviar_mensaje', async (data) => {
+    const { chatId, message, agentEmail, fileUrl, fileName, fileType } = data;
+    
+    try {
+        const chatDoc = await db.collection('chats').doc(chatId).get();
+        if (!chatDoc.exists) { 
+            console.error("Chat no encontrado:", chatId);
+            return;
         }
-    });
+        const chatData = chatDoc.data();
+        const recipientId = chatData.contactId;
+
+        // --- LÓGICA MEJORADA PARA ENVÍO MULTIPLATAFORMA ---
+        if (chatData.platform === 'telegram') {
+            if (telegramBot) {
+                if (fileUrl) {
+                    // Lógica para enviar archivos por Telegram
+                    if (fileType.startsWith('image/')) {
+                        await telegramBot.telegram.sendPhoto(recipientId, { url: fileUrl }, { caption: message });
+                    } else if (fileType.startsWith('video/')) {
+                        await telegramBot.telegram.sendVideo(recipientId, { url: fileUrl }, { caption: message });
+                    } else {
+                        await telegramBot.telegram.sendDocument(recipientId, { url: fileUrl }, { filename: fileName, caption: message });
+                    }
+                } else {
+                    await telegramBot.telegram.sendMessage(recipientId, message);
+                }
+                console.log(`[TELEGRAM] Mensaje enviado a ${recipientId}`);
+            } else {
+                console.error("[TELEGRAM] Se intentó enviar mensaje pero el bot no está inicializado.");
+                // Notificar al frontend que hubo un error
+                socket.emit('envio_fallido', { chatId, error: 'El bot de Telegram no está conectado.' });
+            }
+        } else { // Asumimos que es 'whatsapp' por defecto
+            const client = whatsappClients['default'];
+            if (!client) {
+                console.error("[WHATSAPP] Cliente de WhatsApp no está conectado.");
+                socket.emit('envio_fallido', { chatId, error: 'El cliente de WhatsApp no está conectado.' });
+                return;
+            }
+            
+            if (fileUrl) {
+                if (fileType.startsWith('image/')) {
+                    await client.sendMessage(recipientId, { image: { url: fileUrl }, caption: message });
+                } else if (fileType.startsWith('video/')) {
+                    await client.sendMessage(recipientId, { video: { url: fileUrl }, caption: message });
+                } else if (fileType.startsWith('audio/')) {
+                    await client.sendMessage(recipientId, { audio: { url: fileUrl }, mimetype: fileType });
+                } else {
+                    await client.sendMessage(recipientId, { document: { url: fileUrl }, fileName: fileName });
+                }
+            } else {
+                await client.sendMessage(recipientId, { text: message });
+            }
+            console.log(`[WHATSAPP] Mensaje enviado a ${recipientId}`);
+        }
+
+        // Guardar mensaje enviado en la base de datos (común para ambas plataformas)
+        await db.collection('chats').doc(chatId).collection('messages').add({
+            text: message || fileName,
+            sender: 'agent',
+            agentEmail: agentEmail,
+            timestamp: admin.firestore.FieldValue.serverTimestamp(),
+            fileUrl: fileUrl || null,
+            fileName: fileName || null,
+        });
+        await db.collection('chats').doc(chatId).update({
+            lastMessage: message || fileName,
+            lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp()
+        });
+    } catch (error) {
+        console.error(`Error al enviar mensaje al chat ${chatId}:`, error);
+        socket.emit('envio_fallido', { chatId, error: 'Error interno del servidor al enviar el mensaje.' });
+    }
+});    
 
     socket.on('solicitar_calificacion', async ({ chatId }) => {
         try {
@@ -678,6 +723,21 @@ app.get('/api/kpis/reportes-activos', verifyApiKey, async (req, res) => {
 });
 // --- FIN: Bloque de código para API de KPIs del ERP ---
 
+// --- Endpoint de Health Check ---
+app.get('/health', (req, res) => {
+    // Comprobamos si la instancia del bot de Telegraf (llamada 'bot') está activa.
+    // La variable 'bot' solo existe si el token se cargó correctamente y Telegraf se inició.
+    const isTelegramRunning = typeof bot !== 'undefined' && bot.telegram;
+
+    if (isTelegramRunning) {
+        res.status(200).json({ status: 'ok', telegram: 'connected' });
+    } else {
+        // Si 'bot' no está definido, significa que el token no se encontró o Telegraf falló.
+        res.status(503).json({ status: 'error', telegram: 'disconnected' });
+    }
+});
+
+// --- FIN del bloque de Health Check ---
 
 server.listen(PORT, () => {
     console.log(`Servidor iniciado en puerto ${PORT}`);
