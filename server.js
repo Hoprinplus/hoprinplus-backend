@@ -548,20 +548,19 @@ socket.on('enviar_mensaje', async (data) => {
 
         // --- LÓGICA MEJORADA PARA ENVÍO MULTIPLATAFORMA ---
         if (chatData.platform === 'telegram') {
-            if (telegramBot) {
-                if (fileUrl) {
-                    // Lógica para enviar archivos por Telegram
-                    if (fileType.startsWith('image/')) {
-                        await telegramBot.telegram.sendPhoto(recipientId, { url: fileUrl }, { caption: message });
-                    } else if (fileType.startsWith('video/')) {
-                        await telegramBot.telegram.sendVideo(recipientId, { url: fileUrl }, { caption: message });
-                    } else {
-                        await telegramBot.telegram.sendDocument(recipientId, { url: fileUrl }, { filename: fileName, caption: message });
-                    }
-                } else {
-                    await telegramBot.telegram.sendMessage(recipientId, message);
-                }
-                console.log(`[TELEGRAM] Mensaje enviado a ${recipientId}`);
+    if (bot) { // <-- CORREGIDO a 'bot'
+        if (fileUrl) {
+            if (fileType.startsWith('image/')) {
+                await bot.telegram.sendPhoto(recipientId, { url: fileUrl }, { caption: message }); // <-- CORREGIDO a 'bot'
+            } else if (fileType.startsWith('video/')) {
+                await bot.telegram.sendVideo(recipientId, { url: fileUrl }, { caption: message }); // <-- CORREGIDO a 'bot'
+            } else {
+                await bot.telegram.sendDocument(recipientId, { url: fileUrl }, { filename: fileName, caption: message }); // <-- CORREGIDO a 'bot'
+            }
+        } else {
+            await bot.telegram.sendMessage(recipientId, message); // <-- CORREGIDO a 'bot'
+        }
+        console.log(`[TELEGRAM] Mensaje enviado a ${recipientId}`);
             } else {
                 console.error("[TELEGRAM] Se intentó enviar mensaje pero el bot no está inicializado.");
                 // Notificar al frontend que hubo un error
@@ -743,4 +742,5 @@ server.listen(PORT, () => {
     console.log(`Servidor iniciado en puerto ${PORT}`);
     reconnectChannelsOnStartup();
 });
+
 
