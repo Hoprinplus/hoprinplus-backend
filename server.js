@@ -238,10 +238,13 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_BOT_TOKEN !== 'DISABLED') {
             telegramMessageId: message.message_id
         });
     });
-    bot.launch();
-    console.log("[TELEGRAM] Conector de Telegram iniciado y escuchando mensajes.");
+    bot.launch().then(() => {
+        console.log("[TELEGRAM] Conector de Telegram iniciado y escuchando mensajes.");
+    }).catch((error) => {
+        console.error("[TELEGRAM] Error al iniciar el bot:", error.message);
+    });
 } else {
-    console.warn("[TELEGRAM] Token no encontrado. El conector de Telegram no se iniciará.");
+    console.warn("[TELEGRAM] Token no válido o desactivado. El conector de Telegram no se iniciará.");
 }
 
 
