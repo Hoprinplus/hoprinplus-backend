@@ -71,12 +71,12 @@ if (TELEGRAM_BOT_TOKEN) {
         const deptQuery = await db.collection('departments').where('name', '==', 'Atención al Cliente').limit(1).get();
         if (!deptQuery.empty) {
             atencionDeptId = deptQuery.docs[0].id;
-            console.log(`[TELEGRAM] Departamento 'Atencion al Cliente' encontrado con ID: ${atencionDeptId}`);
+            console.log(`[TELEGRAM] Departamento 'Atención al Cliente' encontrado con ID: ${atencionDeptId}`);
         } else {
-            console.warn("[TELEGRAM] ¡Alerta! El departamento 'Atencion al Cliente' no se encontró en la base de datos.");
+            console.warn("[TELEGRAM] ¡Alerta! El departamento 'Atención al Cliente' no se encontró en la base de datos.");
         }
     } catch (error) {
-        console.error("[TELEGRAM] Error al buscar el departamento 'Atencion al Cliente':", error);
+        console.error("[TELEGRAM] Error al buscar el departamento 'Atención al Cliente':", error);
     }
 
             const newChatData = {
@@ -742,4 +742,5 @@ server.listen(PORT, () => {
     console.log(`Servidor iniciado en puerto ${PORT}`);
     reconnectChannelsOnStartup();
 });
+
 
