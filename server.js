@@ -68,7 +68,7 @@ if (TELEGRAM_BOT_TOKEN) {
     // --- LÓGICA REFORZADA: Asignar SIEMPRE a Atención al Cliente ---
     let atencionDeptId = null;
     try {
-        const deptQuery = await db.collection('departments').where('name', '==', 'Atencion al Cliente').limit(1).get();
+        const deptQuery = await db.collection('departments').where('name', '==', 'Atención al Cliente').limit(1).get();
         if (!deptQuery.empty) {
             atencionDeptId = deptQuery.docs[0].id;
             console.log(`[TELEGRAM] Departamento 'Atencion al Cliente' encontrado con ID: ${atencionDeptId}`);
@@ -547,7 +547,7 @@ socket.on('enviar_mensaje', async (data) => {
         const recipientId = chatData.contactId;
 
         // --- LÓGICA MEJORADA PARA ENVÍO MULTIPLATAFORMA ---
-        if (chatData.platform === 'telegram') {
+       if (chatData.platform === 'telegram') {
     if (bot) { // <-- CORREGIDO a 'bot'
         if (fileUrl) {
             if (fileType.startsWith('image/')) {
@@ -742,5 +742,4 @@ server.listen(PORT, () => {
     console.log(`Servidor iniciado en puerto ${PORT}`);
     reconnectChannelsOnStartup();
 });
-
 
