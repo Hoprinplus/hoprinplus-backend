@@ -311,6 +311,12 @@ async function handleWhatsAppMessages(sock, channelId, m) {
     const messageContent = msg.message[messageType];
     const messageText = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim();
     const senderJid = msg.key.remoteJid;
+	
+	if (!senderJid || !senderJid.endsWith('@s.whatsapp.net')) {
+    console.warn(`[WHATSAPP:${channelId}] Ignorando mensaje de origen no válido: ${senderJid}`);
+    return;
+	}
+
 
     if (msg.key.fromMe) {
         const chatQuery = await db.collection('chats').where('contactPhone', '==', senderJid).limit(1).get();
@@ -341,7 +347,7 @@ async function handleWhatsAppMessages(sock, channelId, m) {
             buffer = Buffer.concat([buffer, chunk]);
         }
         const audioFileName = `audio/${uuidv4()}.ogg`;
-        const fileRef = ref(storage.bucket(), audioFileName);
+        const fileRef = storage.bucket().file(audioFileName);
         await uploadBytes(fileRef, buffer, { contentType: 'audio/ogg' });
         const downloadURL = await getDownloadURL(fileRef);
         messageForDb.fileUrl = downloadURL;
@@ -360,7 +366,7 @@ async function handleWhatsAppMessages(sock, channelId, m) {
             buffer = Buffer.concat([buffer, chunk]);
         }
         const imageFileName = `images/${uuidv4()}.jpg`;
-        const fileRef = ref(storage.bucket(), imageFileName);
+        const fileRef = storage.bucket().file(imageFileName);
         await uploadBytes(fileRef, buffer, { contentType: 'image/jpeg' });
         const downloadURL = await getDownloadURL(fileRef);
         messageForDb.fileUrl = downloadURL;
@@ -379,7 +385,7 @@ async function handleWhatsAppMessages(sock, channelId, m) {
             buffer = Buffer.concat([buffer, chunk]);
         }
         const videoFileName = `videos/${uuidv4()}.mp4`;
-        const fileRef = ref(storage.bucket(), videoFileName);
+        const fileRef = storage.bucket().file(videoFileName);
         await uploadBytes(fileRef, buffer, { contentType: 'video/mp4' });
         const downloadURL = await getDownloadURL(fileRef);
         messageForDb.fileUrl = downloadURL;
@@ -430,7 +436,14 @@ async function handleWhatsAppMessages(sock, channelId, m) {
                 isBotActive: !agentToAssign,
                 botState: {}
             };
-            chatDocRef = await chatsRef.add(newChatData);
+            
+			const isValidContact = /^\d{7,15}@s\.whatsapp\.net$/.test(senderJid);
+				if (!isValidContact) {
+					console.warn(`[WHATSAPP:${channelId}] JID no válido para crear chat: ${senderJid}`);
+				return;
+			}
+		
+			chatDocRef = await chatsRef.add(newChatData);
             chatData = newChatData;
 
             if (agentToAssign) {
