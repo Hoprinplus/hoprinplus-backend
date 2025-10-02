@@ -59,8 +59,15 @@ async function connectToWhatsApp(channelId, isAutoReconnect = false) {
     let connectionTimeout;
 
     const cleanup = async (isLoggedOut = false) => {
+    // Verifica si el socket sigue abierto
     if (sock?.ws?.readyState === NodeWebSocket.OPEN) {
         console.log(`[WHATSAPP:${channelId}] El socket aún está abierto. Evitando limpieza innecesaria.`);
+        return;
+    }
+
+    // Verifica si el cliente sigue conectado (protección adicional)
+    if (sock?.isConnected?.()) {
+        console.log(`[WHATSAPP:${channelId}] Cliente aún conectado. No se requiere limpieza.`);
         return;
     }
 
@@ -487,25 +494,48 @@ io.on('connection', (socket) => {
                 } else {
                     socket.emit('envio_fallido', { chatId, error: 'El bot de Telegram no está conectado.' });
                 }
-            } else { // Asumimos que es 'whatsapp'
-                const channel = await findChannelForChat(chatData);
-                if (!channel || !whatsappClients[channel.id]) {
-                    console.error(`[WHATSAPP] No se encontró cliente conectado para el chat ${chatId}`);
-                    socket.emit('envio_fallido', { chatId, error: 'El canal de WhatsApp para este chat no está conectado.' });
-                    return;
-                }
-                const client = whatsappClients[channel.id];
-                
-                if (fileUrl) {
-                    if (fileType.startsWith('image/')) { await client.sendMessage(recipientId, { image: { url: fileUrl }, caption: message }); } 
-                    else if (fileType.startsWith('video/')) { await client.sendMessage(recipientId, { video: { url: fileUrl }, caption: message }); } 
-                    else if (fileType.startsWith('audio/')) { await client.sendMessage(recipientId, { audio: { url: fileUrl }, mimetype: fileType }); } 
-                    else { await client.sendMessage(recipientId, { document: { url: fileUrl }, fileName: fileName }); }
-                } else {
-                    await client.sendMessage(recipientId, { text: message });
-                }
-                console.log(`[WHATSAPP] Mensaje enviado a ${recipientId}`);
-            }
+            
+		} else { // Asumimos que es 'whatsapp'
+				const channel = await findChannelForChat(chatData);
+				const client = channel && whatsappClients[channel.id];
+
+				if (!client || !client.isConnected?.()) {
+					console.error(`[WHATSAPP] No se encontró cliente conectado para el chat ${chatId}`);
+					socket.emit('envio_fallido', { chatId, error: 'El canal de WhatsApp para este chat no está conectado.' });
+					return;
+				}
+
+				try {
+					if (fileUrl) {
+						if (fileType.startsWith('image/')) {
+						await client.sendMessage(recipientId, { image: { url: fileUrl }, caption: message });
+					} else if (fileType.startsWith('video/')) {
+						await client.sendMessage(recipientId, { video: { url: fileUrl }, caption: message });
+					} else if (fileType.startsWith('audio/')) {
+						await client.sendMessage(recipientId, { audio: { url: fileUrl }, mimetype: fileType });
+					} else {
+						await client.sendMessage(recipientId, { document: { url: fileUrl }, fileName: fileName });
+					}
+				} else {
+					await client.sendMessage(recipientId, { text: message });
+				}
+
+				console.log(`[WHATSAPP] Mensaje enviado a ${recipientId}`);
+			} catch (err) {
+				console.error(`[WHATSAPP] Error al enviar mensaje proactivo:`, err.message);
+				await db.collection('failedMessages').add({
+					chatId,
+					channelId: channel.id,
+					recipientId,
+					messageText: message,
+					error: err.message,
+					timestamp: admin.firestore.FieldValue.serverTimestamp()
+				});
+				socket.emit('envio_fallido', { chatId, error: 'No se pudo enviar el mensaje. El contacto puede no estar disponible.' });
+				return; // NO limpiar sesión
+			}
+		}
+
 
             await db.collection('chats').doc(chatId).collection('messages').add({
                 text: message || fileName, sender: 'agent', agentEmail, timestamp: admin.firestore.FieldValue.serverTimestamp(), fileUrl: fileUrl || null, fileName: fileName || null,
