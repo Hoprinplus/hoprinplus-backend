@@ -42,9 +42,10 @@ const qrCodes = {};
 const qrTimeouts = {};
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+let bot; // <--- 1. Declaramos la variable AFUERA con 'let'
 
 if (TELEGRAM_BOT_TOKEN) {
-    const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
+    bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
     bot.on('text', async (ctx) => {
         const message = ctx.message;
@@ -71,7 +72,7 @@ if (TELEGRAM_BOT_TOKEN) {
         const deptQuery = await db.collection('departments').where('name', '==', 'Atención al Cliente').limit(1).get();
         if (!deptQuery.empty) {
             atencionDeptId = deptQuery.docs[0].id;
-            console.log(`[TELEGRAM] Departamento 'Atención al Cliente' encontrado con ID: ${atencionDeptId}`);
+            console.log(`[TELEGRAM] Departamento 'Atencion al Cliente' encontrado con ID: ${atencionDeptId}`);
         } else {
             console.warn("[TELEGRAM] ¡Alerta! El departamento 'Atención al Cliente' no se encontró en la base de datos.");
         }
@@ -742,5 +743,3 @@ server.listen(PORT, () => {
     console.log(`Servidor iniciado en puerto ${PORT}`);
     reconnectChannelsOnStartup();
 });
-
-
