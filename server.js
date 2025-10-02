@@ -182,7 +182,7 @@ async function reconnectChannelsOnStartup() {
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 let bot;
 
-if (TELEGRAM_BOT_TOKEN) {
+if (TELEGRAM_BOT_TOKEN && TELEGRAM_BOT_TOKEN !== 'DISABLED') {
     bot = new Telegraf(TELEGRAM_BOT_TOKEN);
     bot.on('text', async (ctx) => {
         const message = ctx.message;
