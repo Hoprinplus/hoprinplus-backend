@@ -214,7 +214,6 @@ async function reconnectChannelsOnStartup() {
 // ==================================================================
 
 // --- LÓGICA DEL CONECTOR DE TELEGRAM CON WEBHOOK ---
-const { Telegraf } = require('telegraf');
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const WEBHOOK_PATH = '/telegram-webhook';
 const WEBHOOK_URL = `https://hoprinplus-backend.onrender.com${WEBHOOK_PATH}`;
