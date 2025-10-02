@@ -334,23 +334,85 @@ async function handleWhatsAppMessages(sock, channelId, m) {
         };
         
         if (messageType === 'audioMessage') {
-            try {
-                const stream = await downloadContentFromMessage(messageContent, 'audio');
-                let buffer = Buffer.from([]);
-                for await (const chunk of stream) { buffer = Buffer.concat([buffer, chunk]); }
-                const audioFileName = `audio/${uuidv4()}.ogg`;
-                const fileRef = ref(storage.bucket(), audioFileName);
-                await uploadBytes(fileRef, buffer, { contentType: 'audio/ogg' });
-                const downloadURL = await getDownloadURL(fileRef);
-                messageForDb.fileUrl = downloadURL;
-                messageForDb.fileType = 'audio/ogg';
-                messageForDb.fileName = 'Mensaje de voz';
-                lastMessageTextForDb = '🎤 Mensaje de voz';
-            } catch (audioError) {
-                console.error(`[AUDIO:${channelId}] Error al procesar audio:`, audioError);
-                lastMessageTextForDb = '⚠️ Error al procesar audio';
-            }
+    try {
+        const stream = await downloadContentFromMessage(messageContent, 'audio');
+        let buffer = Buffer.from([]);
+        for await (const chunk of stream) {
+            buffer = Buffer.concat([buffer, chunk]);
         }
+        const audioFileName = `audio/${uuidv4()}.ogg`;
+        const fileRef = ref(storage.bucket(), audioFileName);
+        await uploadBytes(fileRef, buffer, { contentType: 'audio/ogg' });
+        const downloadURL = await getDownloadURL(fileRef);
+        messageForDb.fileUrl = downloadURL;
+        messageForDb.fileType = 'audio/ogg';
+        messageForDb.fileName = 'Mensaje de voz';
+        lastMessageTextForDb = '🎤 Mensaje de voz';
+    } catch (audioError) {
+        console.error(`[AUDIO:${channelId}] Error al procesar audio:`, audioError);
+        lastMessageTextForDb = '⚠️ Error al procesar audio';
+    }
+} else if (messageType === 'imageMessage') {
+    try {
+        const stream = await downloadContentFromMessage(messageContent, 'image');
+        let buffer = Buffer.from([]);
+        for await (const chunk of stream) {
+            buffer = Buffer.concat([buffer, chunk]);
+        }
+        const imageFileName = `images/${uuidv4()}.jpg`;
+        const fileRef = ref(storage.bucket(), imageFileName);
+        await uploadBytes(fileRef, buffer, { contentType: 'image/jpeg' });
+        const downloadURL = await getDownloadURL(fileRef);
+        messageForDb.fileUrl = downloadURL;
+        messageForDb.fileType = 'image/jpeg';
+        messageForDb.fileName = 'Imagen recibida';
+        lastMessageTextForDb = '🖼 Imagen recibida';
+    } catch (imageError) {
+        console.error(`[IMAGEN:${channelId}] Error al procesar imagen:`, imageError);
+        lastMessageTextForDb = '⚠️ Error al procesar imagen';
+    }
+} else if (messageType === 'videoMessage') {
+    try {
+        const stream = await downloadContentFromMessage(messageContent, 'video');
+        let buffer = Buffer.from([]);
+        for await (const chunk of stream) {
+            buffer = Buffer.concat([buffer, chunk]);
+        }
+        const videoFileName = `videos/${uuidv4()}.mp4`;
+        const fileRef = ref(storage.bucket(), videoFileName);
+        await uploadBytes(fileRef, buffer, { contentType: 'video/mp4' });
+        const downloadURL = await getDownloadURL(fileRef);
+        messageForDb.fileUrl = downloadURL;
+        messageForDb.fileType = 'video/mp4';
+        messageForDb.fileName = 'Video recibido';
+        lastMessageTextForDb = '📹 Video recibido';
+    } catch (videoError) {
+        console.error(`[VIDEO:${channelId}] Error al procesar video:`, videoError);
+        lastMessageTextForDb = '⚠️ Error al procesar video';
+    }
+} else if (messageType === 'documentMessage') {
+    try {
+        const stream = await downloadContentFromMessage(messageContent, 'document');
+        let buffer = Buffer.from([]);
+        for await (const chunk of stream) {
+            buffer = Buffer.concat([buffer, chunk]);
+        }
+        const originalName = messageContent.fileName || `documento_${uuidv4()}.pdf`;
+        const extension = originalName.split('.').pop() || 'pdf';
+        const docFileName = `documents/${uuidv4()}.${extension}`;
+        const fileRef = ref(storage.bucket(), docFileName);
+        await uploadBytes(fileRef, buffer, { contentType: messageContent.mimetype || 'application/pdf' });
+        const downloadURL = await getDownloadURL(fileRef);
+        messageForDb.fileUrl = downloadURL;
+        messageForDb.fileType = messageContent.mimetype || 'application/pdf';
+        messageForDb.fileName = originalName;
+        lastMessageTextForDb = '📄 Documento recibido';
+    } catch (docError) {
+        console.error(`[DOCUMENTO:${channelId}] Error al procesar documento:`, docError);
+        lastMessageTextForDb = '⚠️ Error al procesar documento';
+    }
+}
+
         
         if (chatQuery.empty) {
             if (!botSettings.isEnabled) return;
@@ -497,11 +559,17 @@ io.on('connection', (socket) => {
             
 		} else { // Asumimos que es 'whatsapp'
 				const channel = await findChannelForChat(chatData);
+					console.log(`[DEBUG] Intentando enviar mensaje al chat ${chatId}`);
+					console.log(`[DEBUG] Canal resuelto: ${channel?.id}`);
+					console.log(`[DEBUG] Estado del canal: ${channelStates[channel?.id]?.status}`);
+					console.log(`[DEBUG] Cliente WhatsApp presente:`, !!whatsappClients[channel?.id]);
+					console.log(`[DEBUG] Cliente WhatsApp conectado:`, whatsappClients[channel?.id]?.isConnected?.());
+
 				const client = channel && whatsappClients[channel.id];
 
-				if (!client || !client.isConnected?.()) {
-					console.error(`[WHATSAPP] No se encontró cliente conectado para el chat ${chatId}`);
-					socket.emit('envio_fallido', { chatId, error: 'El canal de WhatsApp para este chat no está conectado.' });
+				if (!client || typeof client.sendMessage !== 'function') {
+					console.error(`[WHATSAPP] Cliente no válido para el canal ${channel?.id}`);
+					socket.emit('envio_fallido', { chatId, error: 'El canal de WhatsApp no está conectado correctamente.' });
 					return;
 				}
 
@@ -558,20 +626,27 @@ io.on('connection', (socket) => {
 
 async function findChannelForChat(chatData) {
     if (!chatData.departmentIds || chatData.departmentIds.length === 0) return null;
-    
+
     const allChannelsSnapshot = await db.collection('channels').get();
     if (allChannelsSnapshot.empty) return null;
 
     for (const channelDoc of allChannelsSnapshot.docs) {
         const channelData = channelDoc.data();
-        if (channelData.departmentId && chatData.departmentIds.includes(channelData.departmentId)) {
-            // Este canal está vinculado a uno de los departamentos del chat.
-            return { id: channelDoc.id, ...channelData };
+        const channelId = channelDoc.id;
+        const isConnected = channelStates[channelId]?.status === 'CONNECTED';
+
+        if (
+            channelData.departmentId &&
+            chatData.departmentIds.includes(channelData.departmentId) &&
+            isConnected &&
+            whatsappClients[channelId]
+        ) {
+            return { id: channelId, ...channelData };
         }
     }
+
     return null;
 }
-
 
 // --- ENDPOINTS DE API Y HEALTH CHECK ---
 app.get('/health', (req, res) => {
