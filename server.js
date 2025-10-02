@@ -59,18 +59,34 @@ async function connectToWhatsApp(channelId, isAutoReconnect = false) {
     let connectionTimeout;
 
     const cleanup = async (isLoggedOut = false) => {
-        const reason = isLoggedOut ? 'Cierre de sesión forzado.' : 'Conexión perdida.';
-        console.log(`[WHATSAPP:${channelId}] Realizando limpieza de sesión. Razón: ${reason}`);
-        if (connectionTimeout) clearTimeout(connectionTimeout);
-        delete whatsappClients[channelId];
-        
-        if (isLoggedOut) {
-            await fs.rm(authDir, { recursive: true, force: true }).catch(() => {});
+    if (sock?.ws?.readyState === NodeWebSocket.OPEN) {
+        console.log(`[WHATSAPP:${channelId}] El socket aún está abierto. Evitando limpieza innecesaria.`);
+        return;
+    }
+
+    const reason = isLoggedOut ? 'Cierre de sesión forzado.' : 'Conexión perdida.';
+    console.log(`[WHATSAPP:${channelId}] Realizando limpieza de sesión. Razón: ${reason}`);
+
+    if (connectionTimeout) clearTimeout(connectionTimeout);
+    delete whatsappClients[channelId];
+
+    if (isLoggedOut) {
+        try {
+            await fs.rm(authDir, { recursive: true, force: true });
+            console.log(`[WHATSAPP:${channelId}] Credenciales eliminadas correctamente.`);
+        } catch (err) {
+            console.warn(`[WHATSAPP:${channelId}] No se pudo eliminar la carpeta de autenticación:`, err.message);
         }
-        
-        channelStates[channelId] = { status: 'DISCONNECTED', message: 'Canal desconectado.' };
-        io.emit('channel_status_update', { channelId, status: 'DISCONNECTED', message: 'Canal desconectado.' });
-    };
+    }
+
+    channelStates[channelId] = { status: 'DISCONNECTED', message: 'Canal desconectado.' };
+    io.emit('channel_status_update', {
+        channelId,
+        status: 'DISCONNECTED',
+        message: 'Canal desconectado.'
+    });
+};
+
 
     try {
         const { state, saveCreds } = await useMultiFileAuthState(authDir);
@@ -100,7 +116,7 @@ async function connectToWhatsApp(channelId, isAutoReconnect = false) {
                 connectionTimeout = setTimeout(() => {
                     console.log(`[WHATSAPP:${channelId}] Tiempo de espera para escanear QR agotado.`);
                     sock.end(new Error("QR Timeout"));
-                }, 60000);
+                }, 120000);
 
                 const qrCodeUrl = await qrcode.toDataURL(qr);
                 channelStates[channelId] = { status: 'CONNECTING', message: 'Por favor, escanea el código QR.' };
@@ -118,11 +134,30 @@ async function connectToWhatsApp(channelId, isAutoReconnect = false) {
             }
 
             if (connection === 'close') {
-                const statusCode = (lastDisconnect.error instanceof Boom)?.output?.statusCode;
-                const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.connectionReplaced;
-                
-                await cleanup(isLoggedOut);
-            }
+				const statusCode = (lastDisconnect.error instanceof Boom)?.output?.statusCode;
+				const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.connectionReplaced;
+
+				if (!isLoggedOut) {
+				console.log(`[WHATSAPP:${channelId}] Intentando reconexión automática...`);
+				await cleanup(false);
+				connectToWhatsApp(channelId, true);
+
+				try {
+					await db.collection('logs').add({
+						type: 'whatsapp-reconnect',
+						channelId,
+						timestamp: admin.firestore.FieldValue.serverTimestamp(),
+						reason: 'Reconexión automática por cierre inesperado'
+					});
+					console.log(`[WHATSAPP:${channelId}] Reconexión registrada en Firestore.`);
+				} catch (logError) {
+					console.warn(`[WHATSAPP:${channelId}] No se pudo registrar la reconexión:`, logError.message);
+				}
+			} else {
+				await cleanup(true);
+			}
+}
+
         });
 
         sock.ev.on('creds.update', saveCreds);
@@ -178,12 +213,16 @@ async function reconnectChannelsOnStartup() {
 // --- FIN: NUEVA ARQUITECTURA DE CONEXIÓN WHATSAPP ---
 // ==================================================================
 
-// --- LÓGICA DEL CONECTOR DE TELEGRAM ---
+// --- LÓGICA DEL CONECTOR DE TELEGRAM CON WEBHOOK ---
+const { Telegraf } = require('telegraf');
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const WEBHOOK_PATH = '/telegram-webhook';
+const WEBHOOK_URL = `https://hoprinplus-backend.onrender.com${WEBHOOK_PATH}`;
 let bot;
 
 if (TELEGRAM_BOT_TOKEN && TELEGRAM_BOT_TOKEN !== 'DISABLED') {
     bot = new Telegraf(TELEGRAM_BOT_TOKEN);
+
     bot.on('text', async (ctx) => {
         const message = ctx.message;
         const from = message.from;
@@ -238,15 +277,17 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_BOT_TOKEN !== 'DISABLED') {
             telegramMessageId: message.message_id
         });
     });
-    bot.launch().then(() => {
-        console.log("[TELEGRAM] Conector de Telegram iniciado y escuchando mensajes.");
-    }).catch((error) => {
-        console.error("[TELEGRAM] Error al iniciar el bot:", error.message);
-    });
+
+    // Establecer webhook en Telegram
+    bot.telegram.setWebhook(WEBHOOK_URL);
+
+    // Registrar endpoint en Express
+    app.use(bot.webhookCallback(WEBHOOK_PATH));
+
+    console.log("[TELEGRAM] Webhook configurado correctamente y escuchando mensajes.");
 } else {
     console.warn("[TELEGRAM] Token no válido o desactivado. El conector de Telegram no se iniciará.");
 }
-
 
 // --- LÓGICA DE MANEJO DE MENSAJES DE WHATSAPP ---
 async function handleWhatsAppMessages(sock, channelId, m) {
