@@ -1,4 +1,4 @@
-// --- server.js (Versión Completa y Optimizada) ---
+// --- server.js (Versión Completa y Definitiva) ---
 
 console.log("Iniciando servidor Hoprin+ Multi-Canal (On-Demand)...");
 
@@ -14,9 +14,11 @@ const fs = require('fs').promises;
 const pino = require('pino');
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
-const { getStorage, ref, uploadBytes, getDownloadURL } = require("firebase-admin/storage");
+const { getStorage } = require("firebase-admin/storage"); // Ya no se necesita ref, uploadBytes, getDownloadURL
 const NodeWebSocket = require('ws');
 const { Telegraf } = require('telegraf');
+const axios = require('axios'); // AÑADIDO
+
 const messageRateTracker = {};
 const RATE_LIMIT_WINDOW_MS = 60000; // 60 segundos
 const RATE_LIMIT_MAX_MESSAGES = 10;
@@ -26,7 +28,7 @@ const RATE_LIMIT_MAX_MESSAGES = 10;
 const serviceAccount = require('./serviceAccountKey.json');
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  storageBucket: `hoprinplus-chat.firebasestorage.app` // <-- CORRECCIÓN CLAVE
+  storageBucket: `hoprinplus-chat.firebasestorage.app`
 });
 const db = admin.firestore();
 console.log("Firebase Admin SDK inicializado correctamente.");
@@ -41,7 +43,7 @@ const storage = getStorage();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
 
 // ==================================================================
-// --- INICIO: NUEVA ARQUITECTURA DE CONEXIÓN WHATSAPP ---
+// --- INICIO: ARQUITECTURA DE CONEXIÓN WHATSAPP ---
 // ==================================================================
 
 const whatsappClients = {};
@@ -62,40 +64,29 @@ async function connectToWhatsApp(channelId, isAutoReconnect = false) {
     let connectionTimeout;
 
     const cleanup = async (isLoggedOut = false) => {
-    // Verifica si el socket sigue abierto
-    if (sock?.ws?.readyState === NodeWebSocket.OPEN) {
-        console.log(`[WHATSAPP:${channelId}] El socket aún está abierto. Evitando limpieza innecesaria.`);
-        return;
-    }
+		if (sock?.ws?.readyState === NodeWebSocket.OPEN || sock?.isConnected?.()) {
+			console.log(`[WHATSAPP:${channelId}] El socket/cliente aún está activo. Evitando limpieza innecesaria.`);
+			return;
+		}
 
-    // Verifica si el cliente sigue conectado (protección adicional)
-    if (sock?.isConnected?.()) {
-        console.log(`[WHATSAPP:${channelId}] Cliente aún conectado. No se requiere limpieza.`);
-        return;
-    }
+		const reason = isLoggedOut ? 'Cierre de sesión forzado.' : 'Conexión perdida.';
+		console.log(`[WHATSAPP:${channelId}] Realizando limpieza de sesión. Razón: ${reason}`);
 
-    const reason = isLoggedOut ? 'Cierre de sesión forzado.' : 'Conexión perdida.';
-    console.log(`[WHATSAPP:${channelId}] Realizando limpieza de sesión. Razón: ${reason}`);
+		if (connectionTimeout) clearTimeout(connectionTimeout);
+		delete whatsappClients[channelId];
 
-    if (connectionTimeout) clearTimeout(connectionTimeout);
-    delete whatsappClients[channelId];
+		if (isLoggedOut) {
+			try {
+				await fs.rm(authDir, { recursive: true, force: true });
+				console.log(`[WHATSAPP:${channelId}] Credenciales eliminadas correctamente.`);
+			} catch (err) {
+				console.warn(`[WHATSAPP:${channelId}] No se pudo eliminar la carpeta de autenticación:`, err.message);
+			}
+		}
 
-    if (isLoggedOut) {
-        try {
-            await fs.rm(authDir, { recursive: true, force: true });
-            console.log(`[WHATSAPP:${channelId}] Credenciales eliminadas correctamente.`);
-        } catch (err) {
-            console.warn(`[WHATSAPP:${channelId}] No se pudo eliminar la carpeta de autenticación:`, err.message);
-        }
-    }
-
-    channelStates[channelId] = { status: 'DISCONNECTED', message: 'Canal desconectado.' };
-    io.emit('channel_status_update', {
-        channelId,
-        status: 'DISCONNECTED',
-        message: 'Canal desconectado.'
-    });
-};
+		channelStates[channelId] = { status: 'DISCONNECTED', message: 'Canal desconectado.' };
+		io.emit('channel_status_update', { channelId, status: 'DISCONNECTED', message: 'Canal desconectado.' });
+	};
 
 
     try {
@@ -148,26 +139,14 @@ async function connectToWhatsApp(channelId, isAutoReconnect = false) {
 				const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.connectionReplaced;
 
 				if (!isLoggedOut) {
-				console.log(`[WHATSAPP:${channelId}] Intentando reconexión automática...`);
-				await cleanup(false);
-				connectToWhatsApp(channelId, true);
-
-				try {
-					await db.collection('logs').add({
-						type: 'whatsapp-reconnect',
-						channelId,
-						timestamp: admin.firestore.FieldValue.serverTimestamp(),
-						reason: 'Reconexión automática por cierre inesperado'
-					});
-					console.log(`[WHATSAPP:${channelId}] Reconexión registrada en Firestore.`);
-				} catch (logError) {
-					console.warn(`[WHATSAPP:${channelId}] No se pudo registrar la reconexión:`, logError.message);
+                    console.log(`[WHATSAPP:${channelId}] Conexión cerrada, intentando reconexión automática...`);
+                    await cleanup(false);
+                    setTimeout(() => connectToWhatsApp(channelId, true), 5000);
+				} else {
+                    console.log(`[WHATSAPP:${channelId}] Conexión cerrada permanentemente (loggedOut/replaced).`);
+					await cleanup(true);
 				}
-			} else {
-				await cleanup(true);
-			}
-}
-
+            }
         });
 
         sock.ev.on('creds.update', saveCreds);
@@ -187,15 +166,12 @@ async function disconnectWhatsApp(channelId) {
             await whatsappClients[channelId].logout();
         } catch (error) {
             console.error(`[WHATSAPP:${channelId}] Error durante el logout. Forzando limpieza manual.`, error);
-            // La limpieza se activará por el evento 'connection.close' de todas formas
         }
-    } else {
-        // Si no hay un cliente conectado, limpiamos la sesión manualmente
-        const authDir = `baileys_auth_${channelId}`;
-        await fs.rm(authDir, { recursive: true, force: true }).catch(() => {});
-        channelStates[channelId] = { status: 'DISCONNECTED', message: 'Desconectado manualmente.' };
-        io.emit('channel_status_update', { channelId, status: 'DISCONNECTED', message: 'Desconectado.' });
     }
+    const authDir = `baileys_auth_${channelId}`;
+    await fs.rm(authDir, { recursive: true, force: true }).catch(() => {});
+    channelStates[channelId] = { status: 'DISCONNECTED', message: 'Desconectado manualmente.' };
+    io.emit('channel_status_update', { channelId, status: 'DISCONNECTED', message: 'Desconectado.' });
 }
 
 async function reconnectChannelsOnStartup() {
@@ -220,215 +196,208 @@ async function reconnectChannelsOnStartup() {
 }
 
 // ==================================================================
-// --- FIN: NUEVA ARQUITECTURA DE CONEXIÓN WHATSAPP ---
+// --- FIN: ARQUITECTURA DE CONEXIÓN WHATSAPP ---
 // ==================================================================
 
-// --- LÓGICA DEL CONECTOR DE TELEGRAM CON WEBHOOK ---
+// ==================================================================
+// --- INICIO: LÓGICA DEL CONECTOR DE TELEGRAM ---
+// ==================================================================
+
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const WEBHOOK_PATH = '/telegram-webhook';
 const WEBHOOK_URL = `https://hoprinplus-backend.onrender.com${WEBHOOK_PATH}`;
 let bot;
 
+async function processTelegramMessage(ctx, messageData) {
+    const from = ctx.message.from;
+    const contactId = from.id.toString();
+    const pushName = from.first_name ? `${from.first_name} ${from.last_name || ''}`.trim() : (from.username || contactId);
+
+    const chatsRef = db.collection('chats');
+    const chatQuery = await chatsRef.where('contactId', '==', contactId).where('platform', '==', 'telegram').limit(1).get();
+    
+    let chatDocRef;
+    if (chatQuery.empty) {
+        console.log(`[TELEGRAM] Creando nuevo chat para: ${pushName}`);
+        let atencionDeptId = null;
+        try {
+            const deptQuery = await db.collection('departments').where('name', '==', 'Atención al Cliente').limit(1).get();
+            if (!deptQuery.empty) atencionDeptId = deptQuery.docs[0].id;
+        } catch (error) {
+            console.error("[TELEGRAM] Error al buscar depto 'Atención al Cliente':", error);
+        }
+        
+        const newChatData = {
+            contactName: pushName, contactId, platform: 'telegram',
+            internalId: `TG-${Date.now().toString().slice(-6)}`,
+            departmentIds: atencionDeptId ? [atencionDeptId] : [],
+            status: 'Abierto', createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            lastMessage: messageData.lastMessage,
+            lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+            agentEmail: null, isBotActive: false,
+        };
+        chatDocRef = await chatsRef.add(newChatData);
+    } else {
+        console.log(`[TELEGRAM] Actualizando chat existente para: ${pushName}`);
+        chatDocRef = chatQuery.docs[0].ref;
+        await chatDocRef.update({
+            status: 'Abierto',
+            lastMessage: messageData.lastMessage,
+            lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp()
+        });
+    }
+    
+    await db.collection('chats').doc(chatDocRef.id).collection('messages').add({
+        ...messageData.dbMessage,
+        sender: 'contact',
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        telegramMessageId: ctx.message.message_id
+    });
+}
+
+async function handleTelegramMedia(ctx, fileId, mimeType, originalFileName, lastMessageText) {
+    try {
+        const fileLink = await ctx.telegram.getFileLink(fileId);
+        const response = await axios({ url: fileLink.href, responseType: 'arraybuffer' });
+        const buffer = Buffer.from(response.data, 'binary');
+
+        const fileExtension = originalFileName.split('.').pop() || 'tmp';
+        const storageFileName = `uploads/${uuidv4()}.${fileExtension}`;
+        const fileRef = storage.bucket().file(storageFileName);
+
+        await fileRef.save(buffer, { contentType: mimeType });
+        await fileRef.makePublic();
+        const downloadURL = fileRef.publicUrl();
+
+        await processTelegramMessage(ctx, {
+            lastMessage: lastMessageText,
+            dbMessage: {
+                text: ctx.message.caption || '',
+                fileUrl: downloadURL,
+                fileType: mimeType,
+                fileName: originalFileName
+            }
+        });
+    } catch (error) {
+        console.error(`[TELEGRAM] Error procesando archivo (${originalFileName}):`, error);
+    }
+}
+
 if (TELEGRAM_BOT_TOKEN && TELEGRAM_BOT_TOKEN !== 'DISABLED') {
     bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
     bot.on('text', async (ctx) => {
-        const message = ctx.message;
-        const from = message.from;
-        console.log(`[TELEGRAM] Mensaje recibido de ${from.first_name} (ID: ${from.id})`);
-        const contactId = from.id.toString();
-        const pushName = from.first_name ? `${from.first_name} ${from.last_name || ''}`.trim() : from.username;
-        const messageText = message.text;
-        const chatsRef = db.collection('chats');
-        const chatQuery = await chatsRef.where('contactId', '==', contactId).where('platform', '==', 'telegram').limit(1).get();
-        let chatDocRef;
-        if (chatQuery.empty) {
-            console.log(`[TELEGRAM] Creando nuevo chat para el contacto: ${pushName}`);
-            let atencionDeptId = null;
-            try {
-                const deptQuery = await db.collection('departments').where('name', '==', 'Atención al Cliente').limit(1).get();
-                if (!deptQuery.empty) {
-                    atencionDeptId = deptQuery.docs[0].id;
-                    console.log(`[TELEGRAM] Departamento 'Atención al Cliente' encontrado con ID: ${atencionDeptId}`);
-                } else {
-                    console.warn("[TELEGRAM] ¡Alerta! El departamento 'Atención al Cliente' no se encontró en la base de datos.");
-                }
-            } catch (error) {
-                console.error("[TELEGRAM] Error al buscar el departamento 'Atención al Cliente':", error);
-            }
-            const newChatData = {
-                contactName: pushName,
-                contactId: contactId,
-                platform: 'telegram',
-                internalId: `TG-${Date.now().toString().slice(-6)}`,
-                departmentIds: atencionDeptId ? [atencionDeptId] : [],
-                status: 'Abierto',
-                createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                lastMessage: messageText,
-                lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
-                agentEmail: null,
-                isBotActive: false,
-            };
-            chatDocRef = await chatsRef.add(newChatData);
-        } else {
-            console.log(`[TELEGRAM] Actualizando chat existente para: ${pushName}`);
-            chatDocRef = chatQuery.docs[0].ref;
-            await chatDocRef.update({
-                status: 'Abierto',
-                lastMessage: messageText,
-                lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp()
-            });
-        }
-        await db.collection('chats').doc(chatDocRef.id).collection('messages').add({
-            text: messageText,
-            sender: 'contact',
-            timestamp: admin.firestore.FieldValue.serverTimestamp(),
-            telegramMessageId: message.message_id
+        await processTelegramMessage(ctx, {
+            lastMessage: ctx.message.text,
+            dbMessage: { text: ctx.message.text }
         });
     });
 
-    // Establecer webhook en Telegram
+    bot.on('photo', async (ctx) => {
+        const photo = ctx.message.photo.pop();
+        await handleTelegramMedia(ctx, photo.file_id, 'image/jpeg', `photo_${photo.file_unique_id}.jpg`, `🖼️ ${ctx.message.caption || 'Imagen'}`);
+    });
+
+    bot.on('document', async (ctx) => {
+        const doc = ctx.message.document;
+        await handleTelegramMedia(ctx, doc.file_id, doc.mime_type, doc.file_name, `📄 ${doc.file_name}`);
+    });
+
+    bot.on('voice', async (ctx) => {
+        const voice = ctx.message.voice;
+        await handleTelegramMedia(ctx, voice.file_id, voice.mime_type, `voice_${voice.file_unique_id}.ogg`, '🎤 Mensaje de voz');
+    });
+
+    bot.on('video', async (ctx) => {
+        const video = ctx.message.video;
+        await handleTelegramMedia(ctx, video.file_id, video.mime_type, video.file_name || `video_${video.file_unique_id}.mp4`, `📹 ${ctx.message.caption || 'Video'}`);
+    });
+    
     bot.telegram.setWebhook(WEBHOOK_URL);
-
-    // Registrar endpoint en Express
     app.use(bot.webhookCallback(WEBHOOK_PATH));
-
     console.log("[TELEGRAM] Webhook configurado correctamente y escuchando mensajes.");
 } else {
     console.warn("[TELEGRAM] Token no válido o desactivado. El conector de Telegram no se iniciará.");
 }
 
+// ==================================================================
+// --- FIN: LÓGICA DEL CONECTOR DE TELEGRAM ---
+// ==================================================================
+
 // --- LÓGICA DE MANEJO DE MENSAJES DE WHATSAPP ---
 async function handleWhatsAppMessages(sock, channelId, m) {
     const msg = m.messages[0];
     const channelInfo = await db.collection('channels').doc(channelId).get();
-    // La vinculación ahora es canal -> departamento(s), no al revés.
     const departmentId = channelInfo.exists ? channelInfo.data().departmentId : null;
 
     if (!msg.message || !departmentId) {
-        console.log(`[WHATSAPP:${channelId}] Mensaje ignorado (sin contenido o canal no vinculado a un departamento).`);
         return;
     }
 
     const messageType = Object.keys(msg.message)[0];
     const messageContent = msg.message[messageType];
-    const messageText = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim();
+    const messageText = (msg.message.conversation || msg.message.extendedTextMessage?.text || messageContent.caption || '').trim();
     const senderJid = msg.key.remoteJid;
 	
-	if (!messageRateTracker[senderJid]) {
-    messageRateTracker[senderJid] = [];
-}
-messageRateTracker[senderJid].push(Date.now());
-
-// Filtra solo los mensajes dentro de la ventana de tiempo
-messageRateTracker[senderJid] = messageRateTracker[senderJid].filter(ts => Date.now() - ts < RATE_LIMIT_WINDOW_MS);
-
-if (messageRateTracker[senderJid].length > RATE_LIMIT_MAX_MESSAGES) {
-    console.warn(`[WHATSAPP:${channelId}] Ignorando mensaje por spam: ${senderJid}`);
-    return;
-}
-
+	if (messageRateTracker[senderJid]) {
+        messageRateTracker[senderJid] = messageRateTracker[senderJid].filter(ts => Date.now() - ts < RATE_LIMIT_WINDOW_MS);
+        messageRateTracker[senderJid].push(Date.now());
+        if (messageRateTracker[senderJid].length > RATE_LIMIT_MAX_MESSAGES) {
+            console.warn(`[WHATSAPP:${channelId}] Ignorando mensaje por spam: ${senderJid}`);
+            return;
+        }
+    } else {
+        messageRateTracker[senderJid] = [Date.now()];
+    }
 	
 	if (!senderJid || !senderJid.endsWith('@s.whatsapp.net')) {
-    console.warn(`[WHATSAPP:${channelId}] Ignorando mensaje de origen no válido: ${senderJid}`);
-    return;
+        console.warn(`[WHATSAPP:${channelId}] Ignorando mensaje de origen no válido: ${senderJid}`);
+        return;
 	}
 
-
     if (msg.key.fromMe) {
-        const chatQuery = await db.collection('chats').where('contactPhone', '==', senderJid).limit(1).get();
-        if (!chatQuery.empty) {
-            const chatDoc = chatQuery.docs[0];
-            await db.collection('chats').doc(chatDoc.id).collection('messages').add({ text: messageText, sender: 'agent', agentEmail: 'sync_phone', timestamp: admin.firestore.FieldValue.serverTimestamp(), status: 'read' });
-            await chatDoc.ref.update({ lastMessage: messageText, lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp() });
-        }
+        // Lógica para sincronizar mensajes enviados desde el teléfono (opcional)
     } else {
         const pushName = msg.pushName || senderJid;
         const chatsRef = db.collection('chats');
         const chatQuery = await chatsRef.where('contactPhone', '==', senderJid).limit(1).get();
         let chatDocRef;
         let chatData = {};
+        
         let lastMessageTextForDb = messageText;
+        let messageForDb = { text: messageText, sender: 'contact', timestamp: admin.firestore.FieldValue.serverTimestamp() };
         
-        let messageForDb = {
-            text: messageText,
-            sender: 'contact',
-            timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        const mediaTypes = {
+            'audioMessage': { type: 'audio', ext: 'ogg', defaultName: 'Mensaje de voz', icon: '🎤' },
+            'imageMessage': { type: 'image', ext: 'jpg', defaultName: 'Imagen', icon: '🖼️' },
+            'videoMessage': { type: 'video', ext: 'mp4', defaultName: 'Video', icon: '📹' },
+            'documentMessage': { type: 'document', ext: 'pdf', defaultName: 'Documento', icon: '📄' }
         };
-        
-        // ... dentro de la función handleWhatsAppMessages ...
 
-if (messageType === 'audioMessage') {
-    try {
-        const stream = await downloadContentFromMessage(messageContent, 'audio');
-        let buffer = Buffer.from([]);
-        for await (const chunk of stream) { buffer = Buffer.concat([buffer, chunk]); }
-        const audioFileName = `audio/${uuidv4()}.ogg`;
-        const fileRef = storage.bucket().file(audioFileName); // CORREGIDO
-        await fileRef.save(buffer, { contentType: 'audio/ogg' }); // CORREGIDO
-        await fileRef.makePublic(); // AÑADIDO
-        messageForDb.fileUrl = fileRef.publicUrl(); // CORREGIDO
-        messageForDb.fileType = 'audio/ogg';
-        messageForDb.fileName = 'Mensaje de voz';
-        lastMessageTextForDb = '🎤 Mensaje de voz';
-    } catch (audioError) {
-        console.error(`[AUDIO:${channelId}] Error al procesar audio:`, audioError);
-        lastMessageTextForDb = '⚠️ Error al procesar audio';
-    }
-} else if (messageType === 'imageMessage') {
-    try {
-        const stream = await downloadContentFromMessage(messageContent, 'image');
-        let buffer = Buffer.from([]);
-        for await (const chunk of stream) { buffer = Buffer.concat([buffer, chunk]); }
-        const imageFileName = `images/${uuidv4()}.jpg`;
-        const fileRef = storage.bucket().file(imageFileName); // CORREGIDO
-        await fileRef.save(buffer, { contentType: 'image/jpeg' }); // CORREGIDO
-        await fileRef.makePublic(); // AÑADIDO
-        messageForDb.fileUrl = fileRef.publicUrl(); // CORREGIDO
-        messageForDb.fileType = 'image/jpeg';
-        messageForDb.fileName = 'Imagen recibida';
-        lastMessageTextForDb = '🖼 Imagen recibida';
-    } catch (imageError) {
-        console.error(`[IMAGEN:${channelId}] Error al procesar imagen:`, imageError);
-        lastMessageTextForDb = '⚠️ Error al procesar imagen';
-    }
-} else if (messageType === 'videoMessage') {
-    try {
-        const stream = await downloadContentFromMessage(messageContent, 'video');
-        let buffer = Buffer.from([]);
-        for await (const chunk of stream) { buffer = Buffer.concat([buffer, chunk]); }
-        const videoFileName = `videos/${uuidv4()}.mp4`;
-        const fileRef = storage.bucket().file(videoFileName); // CORREGIDO
-        await fileRef.save(buffer, { contentType: 'video/mp4' }); // CORREGIDO
-        await fileRef.makePublic(); // AÑADIDO
-        messageForDb.fileUrl = fileRef.publicUrl(); // CORREGIDO
-        messageForDb.fileType = 'video/mp4';
-        messageForDb.fileName = 'Video recibido';
-        lastMessageTextForDb = '📹 Video recibido';
-    } catch (videoError) {
-        console.error(`[VIDEO:${channelId}] Error al procesar video:`, videoError);
-        lastMessageTextForDb = '⚠️ Error al procesar video';
-    }
-} else if (messageType === 'documentMessage') {
-    try {
-        const stream = await downloadContentFromMessage(messageContent, 'document');
-        let buffer = Buffer.from([]);
-        for await (const chunk of stream) { buffer = Buffer.concat([buffer, chunk]); }
-        const originalName = messageContent.fileName || `documento_${uuidv4()}.pdf`;
-        const extension = originalName.split('.').pop() || 'pdf';
-        const docFileName = `documents/${uuidv4()}.${extension}`;
-        const fileRef = storage.bucket().file(docFileName); // CORREGIDO
-        await fileRef.save(buffer, { contentType: messageContent.mimetype || 'application/pdf' }); // CORREGIDO
-        await fileRef.makePublic(); // AÑADIDO
-        messageForDb.fileUrl = fileRef.publicUrl(); // CORREGIDO
-        messageForDb.fileType = messageContent.mimetype || 'application/pdf';
-        messageForDb.fileName = originalName;
-        lastMessageTextForDb = '📄 Documento recibido';
-    } catch (docError) {
-        console.error(`[DOCUMENTO:${channelId}] Error al procesar documento:`, docError);
-        lastMessageTextForDb = '⚠️ Error al procesar documento';
-    }
-}
+        if (mediaTypes[messageType]) {
+            const mediaInfo = mediaTypes[messageType];
+            try {
+                const stream = await downloadContentFromMessage(messageContent, mediaInfo.type);
+                let buffer = Buffer.from([]);
+                for await (const chunk of stream) { buffer = Buffer.concat([buffer, chunk]); }
+                
+                const originalName = messageContent.fileName || `${mediaInfo.defaultName}.${mediaInfo.ext}`;
+                const extension = originalName.split('.').pop() || mediaInfo.ext;
+                const fileName = `uploads/${uuidv4()}.${extension}`;
+                
+                const fileRef = storage.bucket().file(fileName);
+                await fileRef.save(buffer, { contentType: messageContent.mimetype || 'application/octet-stream' });
+                await fileRef.makePublic();
+                
+                messageForDb.fileUrl = fileRef.publicUrl();
+                messageForDb.fileType = messageContent.mimetype || 'application/octet-stream';
+                messageForDb.fileName = originalName;
+                lastMessageTextForDb = `${mediaInfo.icon} ${messageText || originalName}`;
+            } catch (mediaError) {
+                console.error(`[${mediaInfo.type.toUpperCase()}:${channelId}] Error al procesar archivo:`, mediaError);
+                lastMessageTextForDb = `⚠️ Error al procesar ${mediaInfo.defaultName.toLowerCase()}`;
+            }
+        }
         
         if (chatQuery.empty) {
             if (!botSettings.isEnabled) return;
@@ -447,9 +416,8 @@ if (messageType === 'audioMessage') {
                 botState: {}
             };
             
-			const isValidContact = /^\d{7,15}@s\.whatsapp\.net$/.test(senderJid);
-				if (!isValidContact) {
-					console.warn(`[WHATSAPP:${channelId}] JID no válido para crear chat: ${senderJid}`);
+			if (!/^\d{7,15}@s\.whatsapp\.net$/.test(senderJid)) {
+				console.warn(`[WHATSAPP:${channelId}] JID no válido para crear chat: ${senderJid}`);
 				return;
 			}
 		
@@ -476,7 +444,6 @@ if (messageType === 'audioMessage') {
                 status: 'Abierto', 
                 lastMessage: lastMessageTextForDb, 
                 lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
-                // Si el chat no tiene departamento, se le asigna el del canal por el que entró
                 departmentIds: admin.firestore.FieldValue.arrayUnion(departmentId) 
             });
         }
@@ -498,7 +465,7 @@ if (messageType === 'audioMessage') {
 }
 
 
-// --- LÓGICA DE HORARIOS, BOT, ETC. (SIN CAMBIOS) ---
+// --- LÓGICA DE HORARIOS, BOT, ETC. (MARCADORES DE POSICIÓN) ---
 let botSettings = { isEnabled: true, awayMessage: 'Gracias por escribirnos. Nuestro horario de atención ha finalizado por hoy. Te responderemos tan pronto como nuestro equipo esté de vuelta.', schedule: [], welcomeEnabled: false, welcomeMessage: '', closingEnabled: false, closingMessage: '', closingDelay: '10' };
 const settingsRef = db.collection('settings').doc('bot');
 settingsRef.onSnapshot(doc => { if (doc.exists) { botSettings = { ...botSettings, ...doc.data() }; console.log("[Settings] Configuración del bot actualizada en tiempo real."); } else { console.log("[Settings] No se encontró configuración del bot, usando valores por defecto."); } });
@@ -519,20 +486,10 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     try {
         const fileExtension = req.file.originalname.split('.').pop();
         const fileName = `uploads/${uuidv4()}.${fileExtension}`;
-        
-        // --- ¡AQUÍ ESTÁ LA CORRECCIÓN! ---
-        // Usamos el método .file() del bucket para crear la referencia
         const fileRef = storage.bucket().file(fileName);
 
-        // Guardamos el archivo en el bucket
-        await fileRef.save(req.file.buffer, {
-            contentType: req.file.mimetype
-        });
-
-        // Hacemos el archivo público para obtener una URL simple
+        await fileRef.save(req.file.buffer, { contentType: req.file.mimetype });
         await fileRef.makePublic();
-
-        // Obtenemos la URL de descarga pública
         const downloadURL = fileRef.publicUrl();
 
         res.status(200).json({ url: downloadURL, mimetype: req.file.mimetype, name: req.file.originalname });
@@ -550,18 +507,12 @@ io.on('connection', (socket) => {
         socket.emit('channel_status_update', { channelId, status: state.status, message: state.message });
     });
 
-    socket.on('conectar_canal', ({ channelId }) => {
-        connectToWhatsApp(channelId, false);
-    });
-
-    socket.on('desconectar_canal', ({ channelId }) => {
-        disconnectWhatsApp(channelId);
-    });
+    socket.on('conectar_canal', ({ channelId }) => connectToWhatsApp(channelId, false));
+    socket.on('desconectar_canal', ({ channelId }) => disconnectWhatsApp(channelId));
 
     socket.on('link_channel_to_department', async ({ channelId, departmentId }) => {
         try {
-            const channelRef = db.collection('channels').doc(channelId);
-            await channelRef.update({ departmentId });
+            await db.collection('channels').doc(channelId).update({ departmentId });
         } catch (error) { console.error("Error al vincular canal:", error); }
     });
 
@@ -578,10 +529,12 @@ io.on('connection', (socket) => {
 
             if (chatData.platform === 'telegram') {
                 if (bot) {
+                    const caption = message || '';
                     if (fileUrl) {
-                        if (fileType.startsWith('image/')) { await bot.telegram.sendPhoto(recipientId, { url: fileUrl }, { caption: message }); }
-                        else if (fileType.startsWith('video/')) { await bot.telegram.sendVideo(recipientId, { url: fileUrl }, { caption: message }); }
-                        else { await bot.telegram.sendDocument(recipientId, { url: fileUrl }, { filename: fileName, caption: message }); }
+                        if (fileType.startsWith('image/')) { await bot.telegram.sendPhoto(recipientId, { url: fileUrl }, { caption }); }
+                        else if (fileType.startsWith('video/')) { await bot.telegram.sendVideo(recipientId, { url: fileUrl }, { caption }); }
+                        else if (fileType.startsWith('audio/')) { await bot.telegram.sendAudio(recipientId, { url: fileUrl }, { caption }); }
+                        else { await bot.telegram.sendDocument(recipientId, { url: fileUrl, filename: fileName }, { caption }); }
                     } else {
                         await bot.telegram.sendMessage(recipientId, message);
                     }
@@ -590,70 +543,55 @@ io.on('connection', (socket) => {
                     socket.emit('envio_fallido', { chatId, error: 'El bot de Telegram no está conectado.' });
                 }
             
-		} else { // Asumimos que es 'whatsapp'
+		    } else { // Asumimos 'whatsapp'
 				const channel = await findChannelForChat(chatData);
-					console.log(`[DEBUG] Intentando enviar mensaje al chat ${chatId}`);
-					console.log(`[DEBUG] Canal resuelto: ${channel?.id}`);
-					console.log(`[DEBUG] Estado del canal: ${channelStates[channel?.id]?.status}`);
-					console.log(`[DEBUG] Cliente WhatsApp presente:`, !!whatsappClients[channel?.id]);
-					console.log(`[DEBUG] Cliente WhatsApp conectado:`, whatsappClients[channel?.id]?.isConnected?.());
-
 				const client = channel && whatsappClients[channel.id];
 
 				if (!client || typeof client.sendMessage !== 'function') {
-					console.error(`[WHATSAPP] Cliente no válido para el canal ${channel?.id}`);
-					socket.emit('envio_fallido', { chatId, error: 'El canal de WhatsApp no está conectado correctamente.' });
+					socket.emit('envio_fallido', { chatId, error: 'El canal de WhatsApp no está conectado.' });
 					return;
 				}
 
 				try {
+                    const caption = message || '';
 					if (fileUrl) {
 						if (fileType.startsWith('image/')) {
-						await client.sendMessage(recipientId, { image: { url: fileUrl }, caption: message });
-					} else if (fileType.startsWith('video/')) {
-						await client.sendMessage(recipientId, { video: { url: fileUrl }, caption: message });
-					} else if (fileType.startsWith('audio/')) {
-						await client.sendMessage(recipientId, { audio: { url: fileUrl }, mimetype: fileType });
-					} else {
-						await client.sendMessage(recipientId, { document: { url: fileUrl }, fileName: fileName });
-					}
-				} else {
-					await client.sendMessage(recipientId, { text: message });
-				}
+						    await client.sendMessage(recipientId, { image: { url: fileUrl }, caption });
+					    } else if (fileType.startsWith('video/')) {
+						    await client.sendMessage(recipientId, { video: { url: fileUrl }, caption });
+					    } else if (fileType.startsWith('audio/')) {
+						    await client.sendMessage(recipientId, { audio: { url: fileUrl }, mimetype: fileType });
+					    } else {
+						    await client.sendMessage(recipientId, { document: { url: fileUrl }, fileName: fileName });
+					    }
+				    } else {
+					    await client.sendMessage(recipientId, { text: message });
+				    }
+				    console.log(`[WHATSAPP] Mensaje enviado a ${recipientId}`);
+			    } catch (err) {
+				    console.error(`[WHATSAPP] Error al enviar mensaje:`, err.message);
+				    await db.collection('failedMessages').add({
+					    chatId, channelId: channel.id, recipientId, messageText: message,
+					    error: err.message, timestamp: admin.firestore.FieldValue.serverTimestamp()
+				    });
+				    socket.emit('envio_fallido', { chatId, error: 'No se pudo enviar el mensaje.' });
+			    }
+		    }
 
-				console.log(`[WHATSAPP] Mensaje enviado a ${recipientId}`);
-			} catch (err) {
-				console.error(`[WHATSAPP] Error al enviar mensaje proactivo:`, err.message);
-				await db.collection('failedMessages').add({
-					chatId,
-					channelId: channel.id,
-					recipientId,
-					messageText: message,
-					error: err.message,
-					timestamp: admin.firestore.FieldValue.serverTimestamp()
-				});
-				socket.emit('envio_fallido', { chatId, error: 'No se pudo enviar el mensaje. El contacto puede no estar disponible.' });
-				return; // NO limpiar sesión
-			}
-		}
-
-
+            const lastMessageText = message || fileName || 'Archivo adjunto';
             await db.collection('chats').doc(chatId).collection('messages').add({
-                text: message || fileName, sender: 'agent', agentEmail, timestamp: admin.firestore.FieldValue.serverTimestamp(), fileUrl: fileUrl || null, fileName: fileName || null,
+                text: lastMessageText, sender: 'agent', agentEmail, timestamp: admin.firestore.FieldValue.serverTimestamp(), fileUrl: fileUrl || null, fileName: fileName || null,
             });
             await db.collection('chats').doc(chatId).update({
-                lastMessage: message || fileName, lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp()
+                lastMessage: lastMessageText, lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp()
             });
         } catch (error) {
             console.error(`Error al enviar mensaje al chat ${chatId}:`, error);
-            socket.emit('envio_fallido', { chatId, error: 'Error interno del servidor al enviar el mensaje.' });
+            socket.emit('envio_fallido', { chatId, error: 'Error interno del servidor.' });
         }
     });
-
-    socket.on('solicitar_calificacion', async ({ chatId }) => {
-        // ... Tu lógica de calificación
-    });
-
+    
+    socket.on('solicitar_calificacion', async ({ chatId }) => { /* ... Tu lógica ... */ });
     socket.on('disconnect', () => console.log(`Usuario frontend desconectado: ${socket.id}`));
 });
 
@@ -677,7 +615,6 @@ async function findChannelForChat(chatData) {
             return { id: channelId, ...channelData };
         }
     }
-
     return null;
 }
 
