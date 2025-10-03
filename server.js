@@ -357,18 +357,18 @@ if (messageRateTracker[senderJid].length > RATE_LIMIT_MAX_MESSAGES) {
             timestamp: admin.firestore.FieldValue.serverTimestamp(),
         };
         
-        if (messageType === 'audioMessage') {
+        // ... dentro de la función handleWhatsAppMessages ...
+
+if (messageType === 'audioMessage') {
     try {
         const stream = await downloadContentFromMessage(messageContent, 'audio');
         let buffer = Buffer.from([]);
-        for await (const chunk of stream) {
-            buffer = Buffer.concat([buffer, chunk]);
-        }
+        for await (const chunk of stream) { buffer = Buffer.concat([buffer, chunk]); }
         const audioFileName = `audio/${uuidv4()}.ogg`;
-        const fileRef = storage.bucket().file(audioFileName);
-        await fileRef.save(buffer, { contentType: 'audio/ogg' });
-        const downloadURL = await getDownloadURL(fileRef);
-        messageForDb.fileUrl = downloadURL;
+        const fileRef = storage.bucket().file(audioFileName); // CORREGIDO
+        await fileRef.save(buffer, { contentType: 'audio/ogg' }); // CORREGIDO
+        await fileRef.makePublic(); // AÑADIDO
+        messageForDb.fileUrl = fileRef.publicUrl(); // CORREGIDO
         messageForDb.fileType = 'audio/ogg';
         messageForDb.fileName = 'Mensaje de voz';
         lastMessageTextForDb = '🎤 Mensaje de voz';
@@ -380,14 +380,12 @@ if (messageRateTracker[senderJid].length > RATE_LIMIT_MAX_MESSAGES) {
     try {
         const stream = await downloadContentFromMessage(messageContent, 'image');
         let buffer = Buffer.from([]);
-        for await (const chunk of stream) {
-            buffer = Buffer.concat([buffer, chunk]);
-        }
+        for await (const chunk of stream) { buffer = Buffer.concat([buffer, chunk]); }
         const imageFileName = `images/${uuidv4()}.jpg`;
-        const fileRef = storage.bucket().file(imageFileName);
-        await fileRef.save(buffer, { contentType: 'image/jpeg' });
-        const downloadURL = await getDownloadURL(fileRef);
-        messageForDb.fileUrl = downloadURL;
+        const fileRef = storage.bucket().file(imageFileName); // CORREGIDO
+        await fileRef.save(buffer, { contentType: 'image/jpeg' }); // CORREGIDO
+        await fileRef.makePublic(); // AÑADIDO
+        messageForDb.fileUrl = fileRef.publicUrl(); // CORREGIDO
         messageForDb.fileType = 'image/jpeg';
         messageForDb.fileName = 'Imagen recibida';
         lastMessageTextForDb = '🖼 Imagen recibida';
@@ -399,14 +397,12 @@ if (messageRateTracker[senderJid].length > RATE_LIMIT_MAX_MESSAGES) {
     try {
         const stream = await downloadContentFromMessage(messageContent, 'video');
         let buffer = Buffer.from([]);
-        for await (const chunk of stream) {
-            buffer = Buffer.concat([buffer, chunk]);
-        }
+        for await (const chunk of stream) { buffer = Buffer.concat([buffer, chunk]); }
         const videoFileName = `videos/${uuidv4()}.mp4`;
-        const fileRef = storage.bucket().file(videoFileName);
-        await fileRef.save(buffer, { contentType: 'video/mp4' });
-        const downloadURL = await getDownloadURL(fileRef);
-        messageForDb.fileUrl = downloadURL;
+        const fileRef = storage.bucket().file(videoFileName); // CORREGIDO
+        await fileRef.save(buffer, { contentType: 'video/mp4' }); // CORREGIDO
+        await fileRef.makePublic(); // AÑADIDO
+        messageForDb.fileUrl = fileRef.publicUrl(); // CORREGIDO
         messageForDb.fileType = 'video/mp4';
         messageForDb.fileName = 'Video recibido';
         lastMessageTextForDb = '📹 Video recibido';
@@ -418,16 +414,14 @@ if (messageRateTracker[senderJid].length > RATE_LIMIT_MAX_MESSAGES) {
     try {
         const stream = await downloadContentFromMessage(messageContent, 'document');
         let buffer = Buffer.from([]);
-        for await (const chunk of stream) {
-            buffer = Buffer.concat([buffer, chunk]);
-        }
+        for await (const chunk of stream) { buffer = Buffer.concat([buffer, chunk]); }
         const originalName = messageContent.fileName || `documento_${uuidv4()}.pdf`;
         const extension = originalName.split('.').pop() || 'pdf';
         const docFileName = `documents/${uuidv4()}.${extension}`;
-		const fileRef = storage.bucket().file(docFileName);
-		await fileRef.save(buffer, { contentType: messageContent.mimetype || 'application/pdf' });
-		const downloadURL = await getDownloadURL(fileRef);
-        messageForDb.fileUrl = downloadURL;
+        const fileRef = storage.bucket().file(docFileName); // CORREGIDO
+        await fileRef.save(buffer, { contentType: messageContent.mimetype || 'application/pdf' }); // CORREGIDO
+        await fileRef.makePublic(); // AÑADIDO
+        messageForDb.fileUrl = fileRef.publicUrl(); // CORREGIDO
         messageForDb.fileType = messageContent.mimetype || 'application/pdf';
         messageForDb.fileName = originalName;
         lastMessageTextForDb = '📄 Documento recibido';
@@ -436,7 +430,6 @@ if (messageRateTracker[senderJid].length > RATE_LIMIT_MAX_MESSAGES) {
         lastMessageTextForDb = '⚠️ Error al procesar documento';
     }
 }
-
         
         if (chatQuery.empty) {
             if (!botSettings.isEnabled) return;
@@ -527,13 +520,21 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     try {
         const fileExtension = req.file.originalname.split('.').pop();
         const fileName = `uploads/${uuidv4()}.${fileExtension}`;
+        
+        // --- ¡AQUÍ ESTÁ LA CORRECCIÓN! ---
+        // Usamos el método .file() del bucket para crear la referencia
         const fileRef = storage.bucket().file(fileName);
 
-        // Guardar el archivo en el bucket
-        await fileRef.save(req.file.buffer, { contentType: req.file.mimetype });
+        // Guardamos el archivo en el bucket
+        await fileRef.save(req.file.buffer, {
+            contentType: req.file.mimetype
+        });
 
-        // Obtener URL de descarga
-        const downloadURL = await getDownloadURL(fileRef);
+        // Hacemos el archivo público para obtener una URL simple
+        await fileRef.makePublic();
+
+        // Obtenemos la URL de descarga pública
+        const downloadURL = fileRef.publicUrl();
 
         res.status(200).json({ url: downloadURL, mimetype: req.file.mimetype, name: req.file.originalname });
     } catch (error) {
@@ -541,7 +542,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         res.status(500).send("Error al subir el archivo.");
     }
 });
-
 
 // --- LÓGICA DE SOCKETS PARA EL FRONTEND ---
 io.on('connection', (socket) => {
