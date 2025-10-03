@@ -14,16 +14,13 @@ const fs = require('fs').promises;
 const pino = require('pino');
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
-const { getStorage } = require("firebase-admin/storage");
+const { getStorage } = require("firebase-admin/storage"); // Ya no se necesita ref, uploadBytes, getDownloadURL
 const NodeWebSocket = require('ws');
 const { Telegraf } = require('telegraf');
-const axios = require('axios');
-
-// --- INICIO DE LA CORRECCIÓN: Creamos un Set para rastrear mensajes enviados desde el CRM
-const crmSentMessageIds = new Set();
+const axios = require('axios'); // AÑADIDO
 
 const messageRateTracker = {};
-const RATE_LIMIT_WINDOW_MS = 60000;
+const RATE_LIMIT_WINDOW_MS = 60000; // 60 segundos
 const RATE_LIMIT_MAX_MESSAGES = 10;
 
 
@@ -328,17 +325,14 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_BOT_TOKEN !== 'DISABLED') {
 // ==================================================================
 
 // --- LÓGICA DE MANEJO DE MENSAJES DE WHATSAPP ---
+// --- PEGAR ESTA FUNCIÓN COMPLETA EN LUGAR DE LA EXISTENTE ---
+
 async function handleWhatsAppMessages(sock, channelId, m) {
     const msg = m.messages[0];
     const channelInfo = await db.collection('channels').doc(channelId).get();
     const departmentId = channelInfo.exists ? channelInfo.data().departmentId : null;
 
     if (!msg.message || !departmentId) {
-        return;
-    }
-
-    if (msg.key.fromMe && crmSentMessageIds.has(msg.key.id)) {
-        crmSentMessageIds.delete(msg.key.id);
         return;
     }
 
@@ -380,6 +374,7 @@ async function handleWhatsAppMessages(sock, channelId, m) {
         const mediaInfo = mediaTypes[messageType];
         const originalName = messageContent.fileName || `${mediaInfo.defaultName}.${mediaInfo.ext}`;
         lastMessageTextForDb = `${mediaInfo.icon} ${messageText || originalName}`;
+        // Para mensajes entrantes, descargamos y subimos. Para salientes, no es necesario.
         if (!msg.key.fromMe) {
             try {
                 const stream = await downloadContentFromMessage(messageContent, mediaInfo.type);
@@ -403,12 +398,16 @@ async function handleWhatsAppMessages(sock, channelId, m) {
     }
 
     if (msg.key.fromMe) {
+        // --- LÓGICA DE SINCRONIZACIÓN (CORREGIDA) ---
         const chatQuery = await db.collection('chats').where('contactPhone', '==', senderJid).limit(1).get();
         if (!chatQuery.empty) {
             const chatDoc = chatQuery.docs[0];
             messageForDb.sender = 'agent';
-            messageForDb.agentEmail = 'sync_phone';
-            messageForDb.status = 'read';
+            messageForDb.agentEmail = 'sync_phone'; // Identificador para saber que vino del teléfono
+            messageForDb.status = 'read'; // Asumimos que el cliente lo lee
+            
+            // Los mensajes con media enviados desde el teléfono no tienen URL en nuestro storage,
+            // por lo que no añadimos fileUrl aquí para evitar confusiones.
             
             await db.collection('chats').doc(chatDoc.id).collection('messages').add(messageForDb);
             await chatDoc.ref.update({ 
@@ -417,6 +416,7 @@ async function handleWhatsAppMessages(sock, channelId, m) {
             });
         }
     } else {
+        // --- LÓGICA DE MENSAJES ENTRANTES (CLIENTE -> CRM) ---
         const pushName = msg.pushName || senderJid;
         const chatsRef = db.collection('chats');
         const chatQuery = await chatsRef.where('contactPhone', '==', senderJid).limit(1).get();
@@ -568,23 +568,18 @@ io.on('connection', (socket) => {
 
 				try {
                     const caption = message || '';
-                    const generatedMsgId = `crm_${uuidv4()}`;
-                    crmSentMessageIds.add(generatedMsgId);
-                    setTimeout(() => crmSentMessageIds.delete(generatedMsgId), 60000);
-                    const messageOptions = { messageId: generatedMsgId };
-
 					if (fileUrl) {
 						if (fileType.startsWith('image/')) {
-						    await client.sendMessage(recipientId, { image: { url: fileUrl }, caption }, messageOptions);
+						    await client.sendMessage(recipientId, { image: { url: fileUrl }, caption });
 					    } else if (fileType.startsWith('video/')) {
-						    await client.sendMessage(recipientId, { video: { url: fileUrl }, caption }, messageOptions);
+						    await client.sendMessage(recipientId, { video: { url: fileUrl }, caption });
 					    } else if (fileType.startsWith('audio/')) {
-						    await client.sendMessage(recipientId, { audio: { url: fileUrl }, mimetype: fileType }, messageOptions);
+						    await client.sendMessage(recipientId, { audio: { url: fileUrl }, mimetype: fileType });
 					    } else {
-						    await client.sendMessage(recipientId, { document: { url: fileUrl }, fileName: fileName }, messageOptions);
+						    await client.sendMessage(recipientId, { document: { url: fileUrl }, fileName: fileName });
 					    }
 				    } else {
-					    await client.sendMessage(recipientId, { text: message }, messageOptions);
+					    await client.sendMessage(recipientId, { text: message });
 				    }
 				    console.log(`[WHATSAPP] Mensaje enviado a ${recipientId}`);
 			    } catch (err) {
