@@ -17,6 +17,10 @@ const { v4: uuidv4 } = require('uuid');
 const { getStorage, ref, uploadBytes, getDownloadURL } = require("firebase-admin/storage");
 const NodeWebSocket = require('ws');
 const { Telegraf } = require('telegraf');
+const messageRateTracker = {};
+const RATE_LIMIT_WINDOW_MS = 60000; // 60 segundos
+const RATE_LIMIT_MAX_MESSAGES = 10;
+
 
 // --- Configuración de Firebase ---
 const serviceAccount = require('./serviceAccountKey.json');
@@ -312,6 +316,20 @@ async function handleWhatsAppMessages(sock, channelId, m) {
     const messageText = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim();
     const senderJid = msg.key.remoteJid;
 	
+	if (!messageRateTracker[senderJid]) {
+    messageRateTracker[senderJid] = [];
+}
+messageRateTracker[senderJid].push(Date.now());
+
+// Filtra solo los mensajes dentro de la ventana de tiempo
+messageRateTracker[senderJid] = messageRateTracker[senderJid].filter(ts => Date.now() - ts < RATE_LIMIT_WINDOW_MS);
+
+if (messageRateTracker[senderJid].length > RATE_LIMIT_MAX_MESSAGES) {
+    console.warn(`[WHATSAPP:${channelId}] Ignorando mensaje por spam: ${senderJid}`);
+    return;
+}
+
+	
 	if (!senderJid || !senderJid.endsWith('@s.whatsapp.net')) {
     console.warn(`[WHATSAPP:${channelId}] Ignorando mensaje de origen no válido: ${senderJid}`);
     return;
@@ -348,7 +366,7 @@ async function handleWhatsAppMessages(sock, channelId, m) {
         }
         const audioFileName = `audio/${uuidv4()}.ogg`;
         const fileRef = storage.bucket().file(audioFileName);
-        await uploadBytes(fileRef, buffer, { contentType: 'audio/ogg' });
+        await fileRef.save(buffer, { contentType: 'audio/ogg' });
         const downloadURL = await getDownloadURL(fileRef);
         messageForDb.fileUrl = downloadURL;
         messageForDb.fileType = 'audio/ogg';
@@ -367,7 +385,7 @@ async function handleWhatsAppMessages(sock, channelId, m) {
         }
         const imageFileName = `images/${uuidv4()}.jpg`;
         const fileRef = storage.bucket().file(imageFileName);
-        await uploadBytes(fileRef, buffer, { contentType: 'image/jpeg' });
+        await fileRef.save(buffer, { contentType: 'image/jpeg' });
         const downloadURL = await getDownloadURL(fileRef);
         messageForDb.fileUrl = downloadURL;
         messageForDb.fileType = 'image/jpeg';
@@ -386,7 +404,7 @@ async function handleWhatsAppMessages(sock, channelId, m) {
         }
         const videoFileName = `videos/${uuidv4()}.mp4`;
         const fileRef = storage.bucket().file(videoFileName);
-        await uploadBytes(fileRef, buffer, { contentType: 'video/mp4' });
+        await fileRef.save(buffer, { contentType: 'video/mp4' });
         const downloadURL = await getDownloadURL(fileRef);
         messageForDb.fileUrl = downloadURL;
         messageForDb.fileType = 'video/mp4';
