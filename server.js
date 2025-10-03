@@ -520,8 +520,6 @@ async function processBotMessage(chatDocRef, chatData, messageText, sock) { /* .
 function isWithinOfficeHours() { /* ... Tu lógica ... */ return true; }
 async function findNextAvailableAgent(departmentId) { /* ... Tu lógica ... */ return null; }
 
-
-// --- ENDPOINT DE UPLOAD (SIN CAMBIOS) ---
 app.post('/upload', upload.single('file'), async (req, res) => {
     if (!req.file) {
         return res.status(400).send('No se subió ningún archivo.');
@@ -529,9 +527,14 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     try {
         const fileExtension = req.file.originalname.split('.').pop();
         const fileName = `uploads/${uuidv4()}.${fileExtension}`;
-        const fileRef = ref(storage.bucket(), fileName);
-        await uploadBytes(fileRef, req.file.buffer, { contentType: req.file.mimetype });
+        const fileRef = storage.bucket().file(fileName);
+
+        // Guardar el archivo en el bucket
+        await fileRef.save(req.file.buffer, { contentType: req.file.mimetype });
+
+        // Obtener URL de descarga
         const downloadURL = await getDownloadURL(fileRef);
+
         res.status(200).json({ url: downloadURL, mimetype: req.file.mimetype, name: req.file.originalname });
     } catch (error) {
         console.error("Error al subir archivo:", error);
