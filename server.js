@@ -424,9 +424,9 @@ if (messageRateTracker[senderJid].length > RATE_LIMIT_MAX_MESSAGES) {
         const originalName = messageContent.fileName || `documento_${uuidv4()}.pdf`;
         const extension = originalName.split('.').pop() || 'pdf';
         const docFileName = `documents/${uuidv4()}.${extension}`;
-        const fileRef = ref(storage.bucket(), docFileName);
-        await uploadBytes(fileRef, buffer, { contentType: messageContent.mimetype || 'application/pdf' });
-        const downloadURL = await getDownloadURL(fileRef);
+		const fileRef = storage.bucket().file(docFileName);
+		await fileRef.save(buffer, { contentType: messageContent.mimetype || 'application/pdf' });
+		const downloadURL = await getDownloadURL(fileRef);
         messageForDb.fileUrl = downloadURL;
         messageForDb.fileType = messageContent.mimetype || 'application/pdf';
         messageForDb.fileName = originalName;
