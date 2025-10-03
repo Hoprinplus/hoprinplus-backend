@@ -24,10 +24,9 @@ const RATE_LIMIT_MAX_MESSAGES = 10;
 
 // --- Configuración de Firebase ---
 const serviceAccount = require('./serviceAccountKey.json');
-const FIREBASE_PROJECT_ID = 'hoprinplus-chat';
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  storageBucket: `${FIREBASE_PROJECT_ID}.appspot.com`
+  storageBucket: `hoprinplus-chat.firebasestorage.app` // <-- CORRECCIÓN CLAVE
 });
 const db = admin.firestore();
 console.log("Firebase Admin SDK inicializado correctamente.");
