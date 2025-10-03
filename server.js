@@ -325,6 +325,8 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_BOT_TOKEN !== 'DISABLED') {
 // ==================================================================
 
 // --- LÓGICA DE MANEJO DE MENSAJES DE WHATSAPP ---
+// --- PEGAR ESTA FUNCIÓN COMPLETA EN LUGAR DE LA EXISTENTE ---
+
 async function handleWhatsAppMessages(sock, channelId, m) {
     const msg = m.messages[0];
     const channelInfo = await db.collection('channels').doc(channelId).get();
@@ -336,7 +338,6 @@ async function handleWhatsAppMessages(sock, channelId, m) {
 
     const messageType = Object.keys(msg.message)[0];
     const messageContent = msg.message[messageType];
-    const messageText = (msg.message.conversation || msg.message.extendedTextMessage?.text || messageContent.caption || '').trim();
     const senderJid = msg.key.remoteJid;
 	
 	if (messageRateTracker[senderJid]) {
@@ -355,36 +356,33 @@ async function handleWhatsAppMessages(sock, channelId, m) {
         return;
 	}
 
-    if (msg.key.fromMe) {
-        // Lógica para sincronizar mensajes enviados desde el teléfono (opcional)
-    } else {
-        const pushName = msg.pushName || senderJid;
-        const chatsRef = db.collection('chats');
-        const chatQuery = await chatsRef.where('contactPhone', '==', senderJid).limit(1).get();
-        let chatDocRef;
-        let chatData = {};
-        
-        let lastMessageTextForDb = messageText;
-        let messageForDb = { text: messageText, sender: 'contact', timestamp: admin.firestore.FieldValue.serverTimestamp() };
-        
-        const mediaTypes = {
-            'audioMessage': { type: 'audio', ext: 'ogg', defaultName: 'Mensaje de voz', icon: '🎤' },
-            'imageMessage': { type: 'image', ext: 'jpg', defaultName: 'Imagen', icon: '🖼️' },
-            'videoMessage': { type: 'video', ext: 'mp4', defaultName: 'Video', icon: '📹' },
-            'documentMessage': { type: 'document', ext: 'pdf', defaultName: 'Documento', icon: '📄' }
-        };
-
-        if (mediaTypes[messageType]) {
-            const mediaInfo = mediaTypes[messageType];
+    const messageText = (msg.message.conversation || msg.message.extendedTextMessage?.text || messageContent.caption || '').trim();
+    let lastMessageTextForDb = messageText;
+    let messageForDb = { 
+        text: messageText, 
+        timestamp: admin.firestore.FieldValue.serverTimestamp()
+    };
+    
+    // --- LÓGICA PARA PROCESAR ARCHIVOS (APLICA A AMBOS CASOS) ---
+    const mediaTypes = {
+        'audioMessage': { type: 'audio', ext: 'ogg', defaultName: 'Mensaje de voz', icon: '🎤' },
+        'imageMessage': { type: 'image', ext: 'jpg', defaultName: 'Imagen', icon: '🖼️' },
+        'videoMessage': { type: 'video', ext: 'mp4', defaultName: 'Video', icon: '📹' },
+        'documentMessage': { type: 'document', ext: 'pdf', defaultName: 'Documento', icon: '📄' }
+    };
+    if (mediaTypes[messageType]) {
+        const mediaInfo = mediaTypes[messageType];
+        const originalName = messageContent.fileName || `${mediaInfo.defaultName}.${mediaInfo.ext}`;
+        lastMessageTextForDb = `${mediaInfo.icon} ${messageText || originalName}`;
+        // Para mensajes entrantes, descargamos y subimos. Para salientes, no es necesario.
+        if (!msg.key.fromMe) {
             try {
                 const stream = await downloadContentFromMessage(messageContent, mediaInfo.type);
                 let buffer = Buffer.from([]);
                 for await (const chunk of stream) { buffer = Buffer.concat([buffer, chunk]); }
                 
-                const originalName = messageContent.fileName || `${mediaInfo.defaultName}.${mediaInfo.ext}`;
                 const extension = originalName.split('.').pop() || mediaInfo.ext;
                 const fileName = `uploads/${uuidv4()}.${extension}`;
-                
                 const fileRef = storage.bucket().file(fileName);
                 await fileRef.save(buffer, { contentType: messageContent.mimetype || 'application/octet-stream' });
                 await fileRef.makePublic();
@@ -392,13 +390,41 @@ async function handleWhatsAppMessages(sock, channelId, m) {
                 messageForDb.fileUrl = fileRef.publicUrl();
                 messageForDb.fileType = messageContent.mimetype || 'application/octet-stream';
                 messageForDb.fileName = originalName;
-                lastMessageTextForDb = `${mediaInfo.icon} ${messageText || originalName}`;
             } catch (mediaError) {
-                console.error(`[${mediaInfo.type.toUpperCase()}:${channelId}] Error al procesar archivo:`, mediaError);
+                console.error(`[${mediaInfo.type.toUpperCase()}:${channelId}] Error al procesar archivo entrante:`, mediaError);
                 lastMessageTextForDb = `⚠️ Error al procesar ${mediaInfo.defaultName.toLowerCase()}`;
             }
         }
+    }
+
+    if (msg.key.fromMe) {
+        // --- LÓGICA DE SINCRONIZACIÓN (CORREGIDA) ---
+        const chatQuery = await db.collection('chats').where('contactPhone', '==', senderJid).limit(1).get();
+        if (!chatQuery.empty) {
+            const chatDoc = chatQuery.docs[0];
+            messageForDb.sender = 'agent';
+            messageForDb.agentEmail = 'sync_phone'; // Identificador para saber que vino del teléfono
+            messageForDb.status = 'read'; // Asumimos que el cliente lo lee
+            
+            // Los mensajes con media enviados desde el teléfono no tienen URL en nuestro storage,
+            // por lo que no añadimos fileUrl aquí para evitar confusiones.
+            
+            await db.collection('chats').doc(chatDoc.id).collection('messages').add(messageForDb);
+            await chatDoc.ref.update({ 
+                lastMessage: lastMessageTextForDb, 
+                lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp() 
+            });
+        }
+    } else {
+        // --- LÓGICA DE MENSAJES ENTRANTES (CLIENTE -> CRM) ---
+        const pushName = msg.pushName || senderJid;
+        const chatsRef = db.collection('chats');
+        const chatQuery = await chatsRef.where('contactPhone', '==', senderJid).limit(1).get();
+        let chatDocRef;
+        let chatData;
         
+        messageForDb.sender = 'contact';
+
         if (chatQuery.empty) {
             if (!botSettings.isEnabled) return;
             if (!isWithinOfficeHours()) {
@@ -411,15 +437,10 @@ async function handleWhatsAppMessages(sock, channelId, m) {
                 contactName: pushName, contactPhone: senderJid, internalId: `WA-${Date.now().toString().slice(-6)}`,
                 departmentIds: [departmentId], platform: 'whatsapp', status: 'Abierto', createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 lastMessage: lastMessageTextForDb, lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
-                agentEmail: agentToAssign, 
-                isBotActive: !agentToAssign,
-                botState: {}
+                agentEmail: agentToAssign, isBotActive: !agentToAssign, botState: {}
             };
             
-			if (!/^\d{7,15}@s\.whatsapp\.net$/.test(senderJid)) {
-				console.warn(`[WHATSAPP:${channelId}] JID no válido para crear chat: ${senderJid}`);
-				return;
-			}
+			if (!/^\d{7,15}@s\.whatsapp\.net$/.test(senderJid)) { return; }
 		
 			chatDocRef = await chatsRef.add(newChatData);
             chatData = newChatData;
@@ -433,9 +454,7 @@ async function handleWhatsAppMessages(sock, channelId, m) {
             
             if (newChatData.isBotActive) {
                 const startNode = activeBotFlow.nodes.find(n => n.type === 'start');
-                if (startNode) {
-                    await executeNode(startNode, sock, senderJid, chatDocRef);
-                }
+                if (startNode) { await executeNode(startNode, sock, senderJid, chatDocRef); }
             }
         } else {
             chatDocRef = chatQuery.docs[0].ref;
@@ -453,17 +472,12 @@ async function handleWhatsAppMessages(sock, channelId, m) {
         if (chatData.isBotActive && messageText) {
             await processBotMessage(chatDocRef, chatData, messageText, sock);
         }
-
         if (chatData.ratingPending && /^[1-5]$/.test(messageText)) {
-            await chatDocRef.update({
-                rating: parseInt(messageText, 10),
-                ratingPending: false
-            });
+            await chatDocRef.update({ rating: parseInt(messageText, 10), ratingPending: false });
             await sock.sendMessage(senderJid, { text: '¡Gracias por tu calificación! 🙌' });
         }
     }
 }
-
 
 // --- LÓGICA DE HORARIOS, BOT, ETC. (MARCADORES DE POSICIÓN) ---
 let botSettings = { isEnabled: true, awayMessage: 'Gracias por escribirnos. Nuestro horario de atención ha finalizado por hoy. Te responderemos tan pronto como nuestro equipo esté de vuelta.', schedule: [], welcomeEnabled: false, welcomeMessage: '', closingEnabled: false, closingMessage: '', closingDelay: '10' };
