@@ -213,6 +213,7 @@ async function processTelegramMessage(ctx, messageData) {
     const from = ctx.message.from;
     const contactId = from.id.toString();
     const pushName = from.first_name ? `${from.first_name} ${from.last_name || ''}`.trim() : (from.username || contactId);
+    const telegramUsername = from.username || null; // <-- CAMBIO: Capturamos el username
 
     const chatsRef = db.collection('chats');
     const chatQuery = await chatsRef.where('contactId', '==', contactId).where('platform', '==', 'telegram').limit(1).get();
@@ -229,7 +230,8 @@ async function processTelegramMessage(ctx, messageData) {
         }
         
         const newChatData = {
-            contactName: pushName, contactId, platform: 'telegram',
+            contactName: pushName, contactId, telegramUsername, // <-- CAMBIO: Se guarda en el nuevo chat
+            platform: 'telegram',
             internalId: `TG-${Date.now().toString().slice(-6)}`,
             departmentIds: atencionDeptId ? [atencionDeptId] : [],
             status: 'Abierto', createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -244,7 +246,8 @@ async function processTelegramMessage(ctx, messageData) {
         await chatDocRef.update({
             status: 'Abierto',
             lastMessage: messageData.lastMessage,
-            lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp()
+            lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+            telegramUsername // <-- CAMBIO: Se actualiza en chats existentes
         });
     }
     
