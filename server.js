@@ -1,4 +1,4 @@
-// --- server.js (Versión Completa y Definitiva) ---
+// --- server.js (Versión con Asignación Rotativa de Agentes) ---
 
 console.log("Iniciando servidor Hoprin+ Multi-Canal (On-Demand)...");
 
@@ -213,7 +213,7 @@ async function processTelegramMessage(ctx, messageData) {
     const from = ctx.message.from;
     const contactId = from.id.toString();
     const pushName = from.first_name ? `${from.first_name} ${from.last_name || ''}`.trim() : (from.username || contactId);
-    const telegramUsername = from.username || null; // <-- CAMBIO: Capturamos el username
+    const telegramUsername = from.username || null;
 
     const chatsRef = db.collection('chats');
     const chatQuery = await chatsRef.where('contactId', '==', contactId).where('platform', '==', 'telegram').limit(1).get();
@@ -229,15 +229,20 @@ async function processTelegramMessage(ctx, messageData) {
             console.error("[TELEGRAM] Error al buscar depto 'Atención al Cliente':", error);
         }
         
+        // ▼▼▼ INICIO: LÓGICA DE ASIGNACIÓN AUTOMÁTICA PARA TELEGRAM ▼▼▼
+        const agentToAssign = await findNextAvailableAgent(atencionDeptId);
+        // ▲▲▲ FIN: LÓGICA DE ASIGNACIÓN AUTOMÁTICA PARA TELEGRAM ▲▲▲
+
         const newChatData = {
-            contactName: pushName, contactId, telegramUsername, // <-- CAMBIO: Se guarda en el nuevo chat
+            contactName: pushName, contactId, telegramUsername,
             platform: 'telegram',
             internalId: `TG-${Date.now().toString().slice(-6)}`,
             departmentIds: atencionDeptId ? [atencionDeptId] : [],
             status: 'Abierto', createdAt: admin.firestore.FieldValue.serverTimestamp(),
             lastMessage: messageData.lastMessage,
             lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
-            agentEmail: null, isBotActive: false,
+            agentEmail: agentToAssign, // <-- CAMBIO: Se asigna el agente aquí
+            isBotActive: false,
         };
         chatDocRef = await chatsRef.add(newChatData);
     } else {
@@ -247,7 +252,7 @@ async function processTelegramMessage(ctx, messageData) {
             status: 'Abierto',
             lastMessage: messageData.lastMessage,
             lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
-            telegramUsername // <-- CAMBIO: Se actualiza en chats existentes
+            telegramUsername
         });
     }
     
@@ -431,12 +436,17 @@ async function handleWhatsAppMessages(sock, channelId, m) {
                 return;
             }
             
+            // ▼▼▼ INICIO: LÓGICA DE ASIGNACIÓN AUTOMÁTICA ▼▼▼
             const agentToAssign = await findNextAvailableAgent(departmentId);
+            // ▲▲▲ FIN: LÓGICA DE ASIGNACIÓN AUTOMÁTICA ▲▲▲
+            
             const newChatData = {
                 contactName: pushName, contactPhone: senderJid, internalId: `WA-${Date.now().toString().slice(-6)}`,
                 departmentIds: [departmentId], platform: 'whatsapp', status: 'Abierto', createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 lastMessage: lastMessageTextForDb, lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
-                agentEmail: agentToAssign, isBotActive: !agentToAssign, botState: {}
+                agentEmail: agentToAssign, // <-- CAMBIO: Se asigna el agente aquí
+                isBotActive: !agentToAssign, 
+                botState: {}
             };
             
 			if (!/^\d{7,15}@s\.whatsapp\.net$/.test(senderJid)) { return; }
@@ -445,6 +455,7 @@ async function handleWhatsAppMessages(sock, channelId, m) {
             chatData = newChatData;
 
             if (agentToAssign) {
+                console.log(`[ASIGNACIÓN] Nuevo chat de ${pushName} asignado a ${agentToAssign}`);
                 io.emit('new_chat_assigned', { chatId: chatDocRef.id, agentEmail: agentToAssign });
                 if (botSettings.welcomeEnabled && botSettings.welcomeMessage) {
                     await sock.sendMessage(senderJid, { text: botSettings.welcomeMessage });
@@ -478,7 +489,7 @@ async function handleWhatsAppMessages(sock, channelId, m) {
     }
 }
 
-// --- LÓGICA DE HORARIOS, BOT, ETC. (MARCADORES DE POSICIÓN) ---
+// --- LÓGICA DE HORARIOS, BOT, ETC. ---
 let botSettings = { isEnabled: true, awayMessage: 'Gracias por escribirnos. Nuestro horario de atención ha finalizado por hoy. Te responderemos tan pronto como nuestro equipo esté de vuelta.', schedule: [], welcomeEnabled: false, welcomeMessage: '', closingEnabled: false, closingMessage: '', closingDelay: '10' };
 const settingsRef = db.collection('settings').doc('bot');
 settingsRef.onSnapshot(doc => { if (doc.exists) { botSettings = { ...botSettings, ...doc.data() }; console.log("[Settings] Configuración del bot actualizada en tiempo real."); } else { console.log("[Settings] No se encontró configuración del bot, usando valores por defecto."); } });
@@ -490,7 +501,72 @@ botFlowRef.onSnapshot(doc => { if (doc.exists) { activeBotFlow = doc.data(); con
 async function executeNode(node, sock, senderJid, chatDocRef) { /* ... Tu lógica ... */ }
 async function processBotMessage(chatDocRef, chatData, messageText, sock) { /* ... Tu lógica ... */ }
 function isWithinOfficeHours() { /* ... Tu lógica ... */ return true; }
-async function findNextAvailableAgent(departmentId) { /* ... Tu lógica ... */ return null; }
+
+// ▼▼▼ INICIO: NUEVA FUNCIÓN DE ASIGNACIÓN ROTATIVA (ROUND-ROBIN) ▼▼▼
+
+// Variable en memoria para rastrear el último agente asignado por departamento
+// ▼▼▼ REEMPLAZA LA FUNCIÓN COMPLETA CON ESTA VERSIÓN CORREGIDA ▼▼▼
+
+// Variable en memoria para rastrear el último agente asignado por departamento
+const lastAssignedAgentIndex = {};
+
+/**
+ * Encuentra el siguiente agente disponible en un departamento usando una estrategia rotativa.
+ * @param {string} departmentId - El ID del departamento de Firestore.
+ * @returns {Promise<string|null>} El email del agente asignado o null si no hay ninguno disponible.
+ */
+async function findNextAvailableAgent(departmentId) {
+    if (!departmentId) {
+        console.warn("[ASIGNACIÓN] Se intentó asignar un chat sin departmentId.");
+        return null;
+    }
+
+    try {
+        // --- INICIO DE LA CORRECCIÓN ---
+        // 1. Obtener el nombre del departamento a partir de su ID.
+        const departmentDoc = await db.collection('departments').doc(departmentId).get();
+        if (!departmentDoc.exists) {
+            console.error(`[ASIGNACIÓN] No se encontró el departamento con ID: ${departmentId}`);
+            return null;
+        }
+        const departmentName = departmentDoc.data().name;
+
+        // 2. Obtener todos los agentes disponibles usando el NOMBRE del departamento.
+        const agentsRef = db.collection('agents');
+        const snapshot = await agentsRef
+            .where('department', '==', departmentName) // <-- CAMBIO CLAVE: Usamos el campo 'department' (nombre)
+            .where('status', '==', 'Disponible')
+            .get();
+        // --- FIN DE LA CORRECCIÓN ---
+
+        if (snapshot.empty) {
+            console.log(`[ASIGNACIÓN] No se encontraron agentes disponibles para el departamento ${departmentName}.`);
+            return null;
+        }
+
+        const availableAgents = snapshot.docs.map(doc => doc.data());
+        
+        // 3. Determinar el índice del próximo agente a asignar (lógica rotativa).
+        if (lastAssignedAgentIndex[departmentId] === undefined) {
+            lastAssignedAgentIndex[departmentId] = -1;
+        }
+
+        const nextIndex = (lastAssignedAgentIndex[departmentId] + 1) % availableAgents.length;
+        lastAssignedAgentIndex[departmentId] = nextIndex;
+
+        const agentToAssign = availableAgents[nextIndex];
+        
+        console.log(`[ASIGNACIÓN] Próximo agente en la rotación para ${departmentName}: ${agentToAssign.email} (Índice: ${nextIndex})`);
+
+        return agentToAssign.email;
+
+    } catch (error) {
+        console.error(`[ASIGNACIÓN] Error crítico al buscar agente disponible para ${departmentId}:`, error);
+        return null;
+    }
+}
+// ▲▲▲ FIN: NUEVA FUNCIÓN DE ASIGNACIÓN ROTATIVA (ROUND-ROBIN) ▲▲▲
+
 
 app.post('/upload', upload.single('file'), async (req, res) => {
     if (!req.file) {
