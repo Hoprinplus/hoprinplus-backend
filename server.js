@@ -694,8 +694,88 @@ io.on('connection', (socket) => {
             socket.emit('envio_fallido', { chatId, error: 'Error interno del servidor.' });
         }
     });
+
+    // --- El nuevo bloque ahora está DENTRO de io.on('connection', ...) ---
+    socket.on('iniciar_nuevo_chat', async (data) => {
+        const { recipientNumber, channelId, initialMessage, agentEmail, agentName } = data;
+        console.log(`[OUTBOUND] Solicitud para iniciar chat con ${recipientNumber} desde canal ${channelId}`);
+
+        if (!recipientNumber || !channelId || !initialMessage || !agentEmail) {
+            return socket.emit('envio_fallido', { error: "Faltan datos para iniciar el chat." });
+        }
+        const formattedNumber = `${recipientNumber.replace(/\D/g, '')}@s.whatsapp.net`;
+        if (!/^\d{10,15}@s\.whatsapp\.net$/.test(formattedNumber)) {
+             return socket.emit('envio_fallido', { error: "El número de teléfono no es válido." });
+        }
+
+        const client = whatsappClients[channelId];
+        if (!client) {
+            return socket.emit('envio_fallido', { error: "El canal de WhatsApp seleccionado no está conectado." });
+        }
+        
+        try {
+            const chatsRef = db.collection('chats');
+            let chatQuery = await chatsRef.where('contactPhone', '==', formattedNumber).limit(1).get();
+            let chatDocRef;
+            let chatId;
+
+            const channelDoc = await db.collection('channels').doc(channelId).get();
+            const departmentId = channelDoc.exists ? channelDoc.data().departmentId : null;
+
+            if (chatQuery.empty) {
+                console.log(`[OUTBOUND] Creando nuevo chat para ${formattedNumber}`);
+                const newChatData = {
+                    contactName: formattedNumber.split('@')[0],
+                    contactPhone: formattedNumber,
+                    internalId: `WA-${Date.now().toString().slice(-6)}`,
+                    departmentIds: departmentId ? [departmentId] : [],
+                    platform: 'whatsapp',
+                    status: 'Abierto',
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                    lastMessage: initialMessage,
+                    lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+                    agentEmail: agentEmail,
+                    isBotActive: false,
+                };
+                chatDocRef = await chatsRef.add(newChatData);
+                chatId = chatDocRef.id;
+            } else {
+                console.log(`[OUTBOUND] El chat con ${formattedNumber} ya existe. Actualizando...`);
+                chatDocRef = chatQuery.docs[0].ref;
+                chatId = chatDocRef.id;
+                await chatDocRef.update({
+                    status: 'Abierto',
+                    agentEmail: agentEmail,
+                    lastMessage: initialMessage,
+                    lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+                });
+            }
+
+            const sentMessage = await client.sendMessage(formattedNumber, { text: initialMessage });
+            
+            await db.collection('chats').doc(chatId).collection('messages').add({
+                text: initialMessage,
+                sender: 'agent',
+                agentEmail: agentEmail,
+                timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                status: 'sent' 
+            });
+
+            if (sentMessage) {
+                crmSentMessageIds.add(sentMessage.key.id);
+                setTimeout(() => crmSentMessageIds.delete(sentMessage.key.id), 60000);
+            }
+            
+            console.log(`[OUTBOUND] Mensaje inicial enviado a ${formattedNumber}`);
+            socket.emit('nuevo_chat_iniciado', { chatId: chatId });
+
+        } catch (error) {
+            console.error(`[OUTBOUND] Error crítico al iniciar nuevo chat:`, error);
+            socket.emit('envio_fallido', { error: `Error del servidor: ${error.message}` });
+        }
+    });
     
-    socket.on('solicitar_calificacion', async ({ chatId }) => { /* ... Tu lógica ... */ });
+    socket.on('solicitar_calificacion', async ({ chatId }) => { /* ... Tu lógica de calificación ... */ });
     socket.on('disconnect', () => console.log(`Usuario frontend desconectado: ${socket.id}`));
 });
 
