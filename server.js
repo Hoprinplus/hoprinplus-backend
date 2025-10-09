@@ -445,7 +445,7 @@ async function handleWhatsAppMessages(sock, channelId, m) {
                 departmentIds: [departmentId], platform: 'whatsapp', status: 'Abierto', createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 lastMessage: lastMessageTextForDb, lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
                 agentEmail: agentToAssign, // <-- CAMBIO: Se asigna el agente aquí
-                isBotActive: !agentToAssign, 
+                isBotActive: false, 
                 botState: {}
             };
             
@@ -849,3 +849,4 @@ server.listen(PORT, () => {
     console.log(`Servidor iniciado en puerto ${PORT}`);
     reconnectChannelsOnStartup();
 });
+
