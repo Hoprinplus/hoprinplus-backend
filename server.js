@@ -469,6 +469,18 @@ async function handleWhatsAppMessages(sock, channelId, m) {
         } else {
             chatDocRef = chatQuery.docs[0].ref;
             chatData = chatQuery.docs[0].data();
+
+		const needsAssignment = !chatData.agentEmail && chatData.status === 'Abierto';
+
+			if (needsAssignment) {
+			const agentToAssign = await findNextAvailableAgent(departmentId);
+			if (agentToAssign) {
+				await chatDocRef.update({ agentEmail: agentToAssign });
+				console.log(`[ASIGNACIÓN] Chat respondido por cliente, asignado a ${agentToAssign}`);
+				io.emit('new_chat_assigned', { chatId: chatDocRef.id, agentEmail: agentToAssign });
+			}
+		}
+			
             await chatDocRef.update({ 
                 status: 'Abierto', 
                 lastMessage: lastMessageTextForDb, 
@@ -849,4 +861,5 @@ server.listen(PORT, () => {
     console.log(`Servidor iniciado en puerto ${PORT}`);
     reconnectChannelsOnStartup();
 });
+
 
