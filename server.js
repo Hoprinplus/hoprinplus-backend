@@ -1,4 +1,4 @@
-// --- server.js (Versión Final Completa con Todas las Mejoras) ---
+// --- server.js (Versión Final y Completa) ---
 
 console.log("Iniciando servidor Hoprin+ Multi-Canal (On-Demand)...");
 
@@ -170,6 +170,7 @@ async function disconnectWhatsApp(channelId) {
     }
     const authDir = `baileys_auth_${channelId}`;
     await fs.rm(authDir, { recursive: true, force: true }).catch(() => {});
+    delete whatsappClients[channelId];
     channelStates[channelId] = { status: 'DISCONNECTED', message: 'Desconectado manualmente.' };
     io.emit('channel_status_update', { channelId, status: 'DISCONNECTED', message: 'Desconectado.' });
 }
@@ -182,11 +183,11 @@ async function reconnectChannelsOnStartup() {
         for (const dir of sessionDirs) {
             const channelId = dir.replace('baileys_auth_', '');
             const channelDoc = await db.collection('channels').doc(channelId).get();
-            if (channelDoc.exists) {
+            if (channelDoc.exists && channelDoc.data().type === 'whatsapp') {
                 console.log(`[WHATSAPP:${channelId}] Se encontró sesión guardada. Intentando reconexión...`);
                 connectToWhatsApp(channelId, true);
             } else {
-                 console.log(`[WHATSAPP:${channelId}] Se encontró sesión huérfana. Limpiando...`);
+                 console.log(`[WHATSAPP:${channelId}] Se encontró sesión huérfana o no es de WhatsApp. Limpiando...`);
                  await fs.rm(dir, { recursive: true, force: true });
             }
         }
@@ -205,9 +206,32 @@ async function reconnectChannelsOnStartup() {
 // ==================================================================
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const WEBHOOK_PATH = '/telegram-webhook';
+const WEBHOOK_PATH = `/telegram-webhook/${TELEGRAM_BOT_TOKEN}`;
 const WEBHOOK_URL = `https://hoprinplus-backend.onrender.com${WEBHOOK_PATH}`;
 let bot;
+let telegramChannelId = null;
+
+// Buscamos el ID del canal de Telegram al iniciar
+db.collection('channels').where('type', '==', 'telegram').limit(1).get().then(snapshot => {
+    if (!snapshot.empty) {
+        telegramChannelId = snapshot.docs[0].id;
+        console.log(`[TELEGRAM] ID del canal de Telegram encontrado: ${telegramChannelId}`);
+    }
+}).catch(err => console.error("[TELEGRAM] Error buscando canal de Telegram:", err));
+
+async function checkTelegramHealth() {
+    if (bot && telegramChannelId) {
+        try {
+            const botInfo = await bot.telegram.getMe();
+            if (botInfo) {
+                channelStates[telegramChannelId] = { status: 'CONNECTED', message: `Conectado como @${botInfo.username}` };
+            }
+        } catch (error) {
+            console.error("[TELEGRAM] Health check fallido:", error.message);
+            channelStates[telegramChannelId] = { status: 'DISCONNECTED', message: 'Token inválido o sin conexión.' };
+        }
+    }
+}
 
 async function processTelegramMessage(ctx, messageData) {
     const from = ctx.message.from;
@@ -334,9 +358,12 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_BOT_TOKEN !== 'DISABLED') {
         await handleTelegramMedia(ctx, video.file_id, video.mime_type, video.file_name || `video_${video.file_unique_id}.mp4`, `📹 ${ctx.message.caption || 'Video'}`);
     });
     
-    bot.telegram.setWebhook(WEBHOOK_URL);
     app.use(bot.webhookCallback(WEBHOOK_PATH));
-    console.log("[TELEGRAM] Webhook configurado correctamente y escuchando mensajes.");
+    bot.telegram.setWebhook(WEBHOOK_URL).then(() => {
+        console.log("[TELEGRAM] Webhook configurado correctamente y escuchando mensajes.");
+        checkTelegramHealth();
+    }).catch(err => console.error("[TELEGRAM] Error al configurar webhook:", err));
+
 } else {
     console.warn("[TELEGRAM] Token no válido o desactivado. El conector de Telegram no se iniciará.");
 }
@@ -611,10 +638,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 io.on('connection', (socket) => {
     console.log(`Un usuario frontend se ha conectado: ${socket.id}`);
 
-    Object.entries(channelStates).forEach(([channelId, state]) => {
-        socket.emit('channel_status_update', { channelId, status: state.status, message: state.message });
-    });
-
     socket.on('conectar_canal', ({ channelId }) => connectToWhatsApp(channelId, false));
     socket.on('desconectar_canal', ({ channelId }) => disconnectWhatsApp(channelId));
 
@@ -624,11 +647,12 @@ io.on('connection', (socket) => {
         } catch (error) { console.error("Error al vincular canal:", error); }
     });
 
-    socket.on('get_all_channel_statuses', () => {
-    Object.entries(channelStates).forEach(([channelId, state]) => {
-        socket.emit('channel_status_update', { channelId, status: state.status, message: state.message });
+    socket.on('get_all_channel_statuses', async () => {
+        await checkTelegramHealth();
+        Object.entries(channelStates).forEach(([channelId, state]) => {
+            socket.emit('channel_status_update', { channelId, status: state.status, message: state.message });
+        });
     });
-});
 	
     socket.on('enviar_mensaje', async (data) => {
         const { chatId, message, agentEmail, fileUrl, fileName, fileType } = data;
@@ -706,8 +730,9 @@ io.on('connection', (socket) => {
                 text: lastMessageText, sender: 'agent', agentEmail, timestamp: admin.firestore.FieldValue.serverTimestamp(), fileUrl: fileUrl || null, fileName: fileName || null,
             });
             await db.collection('chats').doc(chatId).update({
-                lastMessage: lastMessageText, lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
-                lastMessageSender: 'agent' // <-- CORRECCIÓN FINAL AÑADIDA
+                lastMessage: lastMessageText, 
+                lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+                lastMessageSender: 'agent'
             });
         } catch (error) {
             console.error(`Error al enviar mensaje al chat ${chatId}:`, error);
@@ -716,84 +741,88 @@ io.on('connection', (socket) => {
     });
 
     socket.on('iniciar_nuevo_chat', async (data) => {
-        const { recipientNumber, channelId, initialMessage, agentEmail, agentName } = data;
-        console.log(`[OUTBOUND] Solicitud para iniciar chat con ${recipientNumber} desde canal ${channelId}`);
-
-        if (!recipientNumber || !channelId || !initialMessage || !agentEmail) {
-            return socket.emit('envio_fallido', { error: "Faltan datos para iniciar el chat." });
+        const { recipientNumber, name, channelId, initialMessage, agentEmail, departmentId } = data;
+        console.log(`[OUTBOUND] Solicitud para iniciar chat/crear contacto con ${recipientNumber}`);
+    
+        if (!recipientNumber || !name || !departmentId) {
+            return socket.emit('envio_fallido', { error: "Faltan datos (nombre, teléfono, departamento) para crear el contacto." });
         }
         const formattedNumber = `${recipientNumber.replace(/\D/g, '')}@s.whatsapp.net`;
         if (!/^\d{10,15}@s\.whatsapp\.net$/.test(formattedNumber)) {
              return socket.emit('envio_fallido', { error: "El número de teléfono no es válido." });
         }
-
-        const client = whatsappClients[channelId];
-        if (!client) {
-            return socket.emit('envio_fallido', { error: "El canal de WhatsApp seleccionado no está conectado." });
-        }
         
         try {
             const chatsRef = db.collection('chats');
             let chatQuery = await chatsRef.where('contactPhone', '==', formattedNumber).limit(1).get();
-            let chatDocRef;
             let chatId;
-
-            const channelDoc = await db.collection('channels').doc(channelId).get();
-            const departmentId = channelDoc.exists ? channelDoc.data().departmentId : null;
-
+    
             if (chatQuery.empty) {
-                console.log(`[OUTBOUND] Creando nuevo chat para ${formattedNumber}`);
+                console.log(`[OUTBOUND] Creando nuevo chat/contacto para ${formattedNumber}`);
                 const newChatData = {
-                    contactName: formattedNumber.split('@')[0],
+                    contactName: name,
                     contactPhone: formattedNumber,
                     internalId: `WA-${Date.now().toString().slice(-6)}`,
-                    departmentIds: departmentId ? [departmentId] : [],
+                    departmentIds: [departmentId],
                     platform: 'whatsapp',
-                    status: 'Abierto',
+                    status: initialMessage && channelId ? 'Abierto' : 'Cerrado', // Si no hay mensaje, se crea como cerrado
                     createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                    lastMessage: initialMessage,
+                    lastMessage: initialMessage || 'Contacto creado.',
                     lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+                    lastMessageSender: initialMessage && channelId ? 'agent' : null,
                     agentEmail: agentEmail,
                     isBotActive: false,
                 };
-                chatDocRef = await chatsRef.add(newChatData);
+                const chatDocRef = await chatsRef.add(newChatData);
                 chatId = chatDocRef.id;
             } else {
                 console.log(`[OUTBOUND] El chat con ${formattedNumber} ya existe. Actualizando...`);
-                chatDocRef = chatQuery.docs[0].ref;
-                chatId = chatDocRef.id;
-                await chatDocRef.update({
+                chatId = chatQuery.docs[0].id;
+                await chatQuery.docs[0].ref.update({
                     status: 'Abierto',
                     agentEmail: agentEmail,
-                    lastMessage: initialMessage,
+                    lastMessage: initialMessage || 'Chat actualizado.',
                     lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+                    lastMessageSender: initialMessage && channelId ? 'agent' : null,
                 });
-            }
 
-            const sentMessage = await client.sendMessage(formattedNumber, { text: initialMessage });
-            
-            await db.collection('chats').doc(chatId).collection('messages').add({
-                text: initialMessage,
-                sender: 'agent',
-                agentEmail: agentEmail,
-                timestamp: admin.firestore.FieldValue.serverTimestamp(),
-                status: 'sent' 
-            });
-
-            if (sentMessage) {
-                crmSentMessageIds.add(sentMessage.key.id);
-                setTimeout(() => crmSentMessageIds.delete(sentMessage.key.id), 60000);
             }
-            
-            console.log(`[OUTBOUND] Mensaje inicial enviado a ${formattedNumber}`);
+    
+            if (channelId && initialMessage) {
+                const client = whatsappClients[channelId];
+                if (!client) {
+                    console.warn(`[OUTBOUND] El contacto ${chatId} fue creado/actualizado, pero no se envió mensaje porque el canal ${channelId} no está conectado.`);
+                    socket.emit('nuevo_chat_iniciado', { chatId: chatId, message: 'Contacto creado, pero el canal no está conectado para enviar el mensaje.' });
+                    return;
+                }
+    
+                const sentMessage = await client.sendMessage(formattedNumber, { text: initialMessage });
+                
+                await db.collection('chats').doc(chatId).collection('messages').add({
+                    text: initialMessage,
+                    sender: 'agent',
+                    agentEmail: agentEmail,
+                    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                    status: 'sent' 
+                });
+    
+                if (sentMessage) {
+                    crmSentMessageIds.add(sentMessage.key.id);
+                }
+                
+                console.log(`[OUTBOUND] Mensaje inicial enviado a ${formattedNumber}`);
+            } else {
+                console.log(`[OUTBOUND] Contacto ${chatId} creado/actualizado sin enviar mensaje inicial.`);
+            }
+    
             socket.emit('nuevo_chat_iniciado', { chatId: chatId });
-
+    
         } catch (error) {
             console.error(`[OUTBOUND] Error crítico al iniciar nuevo chat:`, error);
             socket.emit('envio_fallido', { error: `Error del servidor: ${error.message}` });
         }
     });
-    
+
     socket.on('solicitar_calificacion', async ({ chatId }) => { /* ... Tu lógica de calificación ... */ });
     socket.on('disconnect', () => console.log(`Usuario frontend desconectado: ${socket.id}`));
 });
