@@ -238,28 +238,39 @@ async function processTelegramMessage(ctx, messageData) {
     const contactId = from.id.toString();
     const pushName = from.first_name ? `${from.first_name} ${from.last_name || ''}`.trim() : (from.username || contactId);
     const telegramUsername = from.username || null;
+    
+    // --- INICIO DE LA CORRECCIÓN ---
+    // Obtenemos el ID del departamento de "Atención al Cliente" al principio
+    let atencionDeptId = null;
+    try {
+        const deptQuery = await db.collection('departments').where('name', '==', 'Atención al Cliente').limit(1).get();
+        if (!deptQuery.empty) atencionDeptId = deptQuery.docs[0].id;
+    } catch (error) {
+        console.error("[TELEGRAM] Error al buscar depto 'Atención al Cliente':", error);
+    }
+    if (!atencionDeptId) {
+        console.error("[TELEGRAM] No se pudo encontrar el ID del departamento 'Atención al Cliente'. No se puede procesar el mensaje.");
+        return;
+    }
 
     const chatsRef = db.collection('chats');
-    const chatQuery = await chatsRef.where('contactId', '==', contactId).where('platform', '==', 'telegram').limit(1).get();
+    // Ahora buscamos un chat que coincida con el ID de contacto, la plataforma Y el departamento.
+    const chatQuery = await chatsRef
+        .where('contactId', '==', contactId)
+        .where('platform', '==', 'telegram')
+        .where('departmentIds', 'array-contains', atencionDeptId)
+        .limit(1).get();
+    // --- FIN DE LA CORRECCIÓN ---
     
     let chatDocRef;
     if (chatQuery.empty) {
         console.log(`[TELEGRAM] Creando nuevo chat para: ${pushName}`);
-        let atencionDeptId = null;
-        try {
-            const deptQuery = await db.collection('departments').where('name', '==', 'Atención al Cliente').limit(1).get();
-            if (!deptQuery.empty) atencionDeptId = deptQuery.docs[0].id;
-        } catch (error) {
-            console.error("[TELEGRAM] Error al buscar depto 'Atención al Cliente':", error);
-        }
-        
         const agentToAssign = await findNextAvailableAgent(atencionDeptId);
-
         const newChatData = {
             contactName: pushName, contactId, telegramUsername,
             platform: 'telegram',
             internalId: `TG-${Date.now().toString().slice(-6)}`,
-            departmentIds: atencionDeptId ? [atencionDeptId] : [],
+            departmentIds: [atencionDeptId], // Usamos el ID que ya buscamos
             status: 'Abierto', createdAt: admin.firestore.FieldValue.serverTimestamp(),
             lastMessage: messageData.lastMessage,
             lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
@@ -272,8 +283,6 @@ async function processTelegramMessage(ctx, messageData) {
         console.log(`[TELEGRAM] Actualizando chat existente para: ${pushName}`);
         chatDocRef = chatQuery.docs[0].ref;
         const chatData = chatQuery.docs[0].data();
-
-        // --- INICIO: LÓGICA DE REASIGNACIÓN ---
         if (chatData.agentEmail) {
             const agentQuery = await db.collection('agents').where('email', '==', chatData.agentEmail).limit(1).get();
             if (!agentQuery.empty && agentQuery.docs[0].data().status === 'Ausente') {
@@ -281,8 +290,6 @@ async function processTelegramMessage(ctx, messageData) {
                 console.log(`[REASIGNACIÓN] Chat de Telegram ${chatDocRef.id} desasignado del agente ausente ${chatData.agentEmail}.`);
             }
         }
-        // --- FIN: LÓGICA DE REASIGNACIÓN ---
-        
 		await chatDocRef.update({
             status: 'Abierto',
             lastMessage: messageData.lastMessage,
@@ -368,11 +375,8 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_BOT_TOKEN !== 'DISABLED') {
     console.warn("[TELEGRAM] Token no válido o desactivado. El conector de Telegram no se iniciará.");
 }
 
-// ==================================================================
-// --- FIN: LÓGICA DEL CONECTOR DE TELEGRAM ---
-// ==================================================================
+// Archivo: server.js -> Reemplaza esta función completa
 
-// --- LÓGICA DE MANEJO DE MENSAJES DE WHATSAPP ---
 async function handleWhatsAppMessages(sock, channelId, m) {
     const msg = m.messages[0];
     const channelInfo = await db.collection('channels').doc(channelId).get();
@@ -413,12 +417,7 @@ async function handleWhatsAppMessages(sock, channelId, m) {
         timestamp: admin.firestore.FieldValue.serverTimestamp()
     };
     
-    const mediaTypes = {
-        'audioMessage': { type: 'audio', ext: 'ogg', defaultName: 'Mensaje de voz', icon: '🎤' },
-        'imageMessage': { type: 'image', ext: 'jpg', defaultName: 'Imagen', icon: '🖼️' },
-        'videoMessage': { type: 'video', ext: 'mp4', defaultName: 'Video', icon: '📹' },
-        'documentMessage': { type: 'document', ext: 'pdf', defaultName: 'Documento', icon: '📄' }
-    };
+    const mediaTypes = { 'audioMessage': { type: 'audio', ext: 'ogg', defaultName: 'Mensaje de voz', icon: '🎤' }, 'imageMessage': { type: 'image', ext: 'jpg', defaultName: 'Imagen', icon: '🖼️' }, 'videoMessage': { type: 'video', ext: 'mp4', defaultName: 'Video', icon: '📹' }, 'documentMessage': { type: 'document', ext: 'pdf', defaultName: 'Documento', icon: '📄' } };
     if (mediaTypes[messageType]) {
         const mediaInfo = mediaTypes[messageType];
         const originalName = messageContent.fileName || `${mediaInfo.defaultName}.${mediaInfo.ext}`;
@@ -428,13 +427,11 @@ async function handleWhatsAppMessages(sock, channelId, m) {
                 const stream = await downloadContentFromMessage(messageContent, mediaInfo.type);
                 let buffer = Buffer.from([]);
                 for await (const chunk of stream) { buffer = Buffer.concat([buffer, chunk]); }
-                
                 const extension = originalName.split('.').pop() || mediaInfo.ext;
                 const fileName = `uploads/${uuidv4()}.${extension}`;
                 const fileRef = storage.bucket().file(fileName);
                 await fileRef.save(buffer, { contentType: messageContent.mimetype || 'application/octet-stream' });
                 await fileRef.makePublic();
-                
                 messageForDb.fileUrl = fileRef.publicUrl();
                 messageForDb.fileType = messageContent.mimetype || 'application/octet-stream';
                 messageForDb.fileName = originalName;
@@ -452,18 +449,18 @@ async function handleWhatsAppMessages(sock, channelId, m) {
             messageForDb.sender = 'agent';
             messageForDb.agentEmail = 'sync_phone';
             messageForDb.status = 'read';
-            
             await db.collection('chats').doc(chatDoc.id).collection('messages').add(messageForDb);
-            await chatDoc.ref.update({ 
-                lastMessage: lastMessageTextForDb, 
-                lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
-                lastMessageSender: 'agent'
-            });
+            await chatDoc.ref.update({ lastMessage: lastMessageTextForDb, lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(), lastMessageSender: 'agent' });
         }
     } else {
         const pushName = msg.pushName || senderJid;
         const chatsRef = db.collection('chats');
-        const chatQuery = await chatsRef.where('contactPhone', '==', senderJid).limit(1).get();
+        
+        // --- INICIO DE LA CORRECCIÓN CLAVE ---
+        // Ahora buscamos un chat que coincida con el teléfono Y el departamento actual.
+        const chatQuery = await chatsRef.where('contactPhone', '==', senderJid).where('departmentIds', 'array-contains', departmentId).limit(1).get();
+        // --- FIN DE LA CORRECCIÓN CLAVE ---
+
         let chatDocRef;
         let chatData;
         
@@ -475,9 +472,7 @@ async function handleWhatsAppMessages(sock, channelId, m) {
                 if (botSettings.awayEnabled && botSettings.awayMessage) { await sock.sendMessage(senderJid, { text: botSettings.awayMessage }); }
                 return;
             }
-            
             const agentToAssign = await findNextAvailableAgent(departmentId);
-            
             const newChatData = {
                 contactName: pushName, contactPhone: senderJid, internalId: `WA-${Date.now().toString().slice(-6)}`,
                 departmentIds: [departmentId], platform: 'whatsapp', status: 'Abierto', createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -487,12 +482,9 @@ async function handleWhatsAppMessages(sock, channelId, m) {
                 isBotActive: false, 
                 botState: {}
             };
-            
-			if (!/^\d{7,15}@s\.whatsapp\.net$/.test(senderJid)) { return; }
-		
+            if (!/^\d{7,15}@s\.whatsapp\.net$/.test(senderJid)) { return; }
 			chatDocRef = await chatsRef.add(newChatData);
             chatData = newChatData;
-
             if (agentToAssign) {
                 console.log(`[ASIGNACIÓN] Nuevo chat de ${pushName} asignado a ${agentToAssign}`);
                 io.emit('new_chat_assigned', { chatId: chatDocRef.id, agentEmail: agentToAssign });
@@ -500,7 +492,6 @@ async function handleWhatsAppMessages(sock, channelId, m) {
                     await sock.sendMessage(senderJid, { text: botSettings.welcomeMessage });
                 }
             }
-            
             if (newChatData.isBotActive) {
                 const startNode = activeBotFlow.nodes.find(n => n.type === 'start');
                 if (startNode) { await executeNode(startNode, sock, senderJid, chatDocRef); }
@@ -508,20 +499,15 @@ async function handleWhatsAppMessages(sock, channelId, m) {
         } else {
             chatDocRef = chatQuery.docs[0].ref;
             chatData = chatQuery.docs[0].data();
-
-            // --- INICIO: LÓGICA DE REASIGNACIÓN POR INACTIVIDAD ---
             if (chatData.agentEmail) {
                 const agentQuery = await db.collection('agents').where('email', '==', chatData.agentEmail).limit(1).get();
                 if (!agentQuery.empty && agentQuery.docs[0].data().status === 'Ausente') {
                     await chatDocRef.update({ agentEmail: null });
-                    chatData.agentEmail = null; // Actualizamos la variable local para la lógica que sigue
+                    chatData.agentEmail = null;
                     console.log(`[REASIGNACIÓN] Chat ${chatDocRef.id} desasignado del agente ausente.`);
                 }
             }
-            // --- FIN: LÓGICA DE REASIGNACIÓN ---
-			
 		    const needsAssignment = !chatData.agentEmail && chatData.status === 'Abierto';
-
 			if (needsAssignment) {
 			    const agentToAssign = await findNextAvailableAgent(departmentId);
 			    if (agentToAssign) {
@@ -530,7 +516,6 @@ async function handleWhatsAppMessages(sock, channelId, m) {
 				    io.emit('new_chat_assigned', { chatId: chatDocRef.id, agentEmail: agentToAssign });
 			    }
 		    }
-			
             await chatDocRef.update({ 
                 status: 'Abierto', 
                 lastMessage: lastMessageTextForDb, 
@@ -539,9 +524,7 @@ async function handleWhatsAppMessages(sock, channelId, m) {
                 departmentIds: admin.firestore.FieldValue.arrayUnion(departmentId) 
             });
         }
-        
         await db.collection('chats').doc(chatDocRef.id).collection('messages').add(messageForDb);
-        
         if (chatData.isBotActive && messageText) {
             await processBotMessage(chatDocRef, chatData, messageText, sock);
         }
