@@ -467,8 +467,6 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_BOT_TOKEN !== 'DISABLED') {
     console.warn("[TELEGRAM] Token no válido o desactivado. El conector de Telegram no se iniciará.");
 }
 
-// Archivo: server.js -> Reemplaza esta función completa (Líneas ~377 a ~583)
-
 async function handleWhatsAppMessages(sock, channelId, m) {
     const msg = m.messages[0];
     const channelInfo = await db.collection('channels').doc(channelId).get();
@@ -510,13 +508,13 @@ async function handleWhatsAppMessages(sock, channelId, m) {
         timestamp: admin.firestore.FieldValue.serverTimestamp()
     };
 
-    // --- Captura de Citas (Sin cambios) ---
+    // --- Captura de Citas (Opción C - Sin cambios) ---
 	const contextInfo = messageContent?.contextInfo;
     if (contextInfo?.quotedMessage) {
         try {
             const quotedMsg = contextInfo.quotedMessage;
             const quotedSenderJid = contextInfo.participant;
-            const quotedSender = (quotedSenderJid === sock.user.id) ? 'agent' : 'contact'; // Comparar directamente con sock.user.id
+            const quotedSender = (quotedSenderJid === sock.user.id) ? 'agent' : 'contact';
             const quotedText = quotedMsg.conversation ||
                                quotedMsg.extendedTextMessage?.text ||
                                (quotedMsg.imageMessage?.caption) ||
@@ -530,9 +528,10 @@ async function handleWhatsAppMessages(sock, channelId, m) {
     }
     // --- Fin Captura de Citas ---
 
-    // --- Procesamiento de Archivos Multimedia (Sin cambios, incluye logging mejorado) ---
+    // --- Procesamiento de Archivos Multimedia (Sin cambios) ---
     const mediaTypes = { 'audioMessage': { type: 'audio', ext: 'ogg', defaultName: 'Mensaje de voz', icon: '🎤' }, 'imageMessage': { type: 'image', ext: 'jpg', defaultName: 'Imagen', icon: '🖼️' }, 'videoMessage': { type: 'video', ext: 'mp4', defaultName: 'Video', icon: '📹' }, 'documentMessage': { type: 'document', ext: 'pdf', defaultName: 'Documento', icon: '📄' } };
     if (mediaTypes[messageType]) {
+        // ... (lógica de procesamiento de mediaTypes sin cambios) ...
         const mediaInfo = mediaTypes[messageType];
         const originalName = messageContent.fileName || `${mediaInfo.defaultName}.${mediaInfo.ext}`;
         lastMessageTextForDb = `${mediaInfo.icon} ${messageText || originalName}`;
@@ -561,7 +560,6 @@ async function handleWhatsAppMessages(sock, channelId, m) {
     }
     // --- Fin Procesamiento Multimedia ---
 
-
     // --- Sincronización de mensajes enviados desde el teléfono (Sin cambios) ---
     if (msg.key.fromMe) {
         const chatQuery = await db.collection('chats').where('contactPhone', '==', senderJid).limit(1).get();
@@ -570,6 +568,7 @@ async function handleWhatsAppMessages(sock, channelId, m) {
             messageForDb.sender = 'agent';
             messageForDb.agentEmail = 'sync_phone';
             messageForDb.status = 'read';
+            // No guardamos waMessageId para mensajes salientes del teléfono (a menos que sea necesario)
             await db.collection('chats').doc(chatDoc.id).collection('messages').add(messageForDb);
             await chatDoc.ref.update({ lastMessage: lastMessageTextForDb, lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(), lastMessageSender: 'agent' });
         }
@@ -585,17 +584,18 @@ async function handleWhatsAppMessages(sock, channelId, m) {
         let chatDocRef;
         let chatData;
         messageForDb.sender = 'contact';
+        
+        // --- INICIO DE LA MODIFICACIÓN (Guardar waMessageId) ---
+        messageForDb.waMessageId = msg.key.id; // <-- ¡AÑADIDO! Guardamos el ID de WhatsApp
+        // --- FIN DE LA MODIFICACIÓN ---
 
         // --- LÓGICA PARA CHAT NUEVO (if chatQuery.empty) ---
         if (chatQuery.empty) {
+            // ... (lógica de 'if chatQuery.empty' sin cambios) ...
             const deptDoc = await db.collection('departments').doc(departmentId).get();
             const departmentName = deptDoc.exists ? deptDoc.data().name : null;
-            let agentToAssign = null; // Por defecto no se asigna agente
-
-            // Verificamos si estamos DENTRO del horario laboral
+            let agentToAssign = null;
             const withinOfficeHours = isWithinOfficeHours();
-
-            // Lógica de Mensaje de Ausente (Solo Atención al Cliente)
             if (!withinOfficeHours && botSettings.awayEnabled && botSettings.awayMessage && departmentName === 'Atención al Cliente') {
                  try {
                      await sock.sendMessage(senderJid, { text: botSettings.awayMessage });
@@ -604,39 +604,28 @@ async function handleWhatsAppMessages(sock, channelId, m) {
                      console.error(`[WHATSAPP:${channelId}] Error enviando mensaje de ausente:`, awayMsgError);
                  }
             }
-
-            // SOLO asignamos agente si estamos DENTRO del horario laboral
             if (withinOfficeHours) {
                 agentToAssign = await findNextAvailableAgent(departmentId);
             } else {
                  console.log(`[WHATSAPP:${channelId}] Chat nuevo de ${pushName} recibido fuera de horario. No se asignará agente.`);
             }
-
-            // Creamos el chat (SIEMPRE, incluso fuera de horario)
             const newChatData = {
                 contactName: pushName, contactPhone: senderJid, internalId: `WA-${Date.now().toString().slice(-6)}`,
                 departmentIds: [departmentId], platform: 'whatsapp', status: 'Abierto', createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 lastMessage: lastMessageTextForDb, lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
                 lastMessageSender: 'contact',
-                agentEmail: agentToAssign, // Puede ser null si es fuera de horario
+                agentEmail: agentToAssign,
                 isBotActive: false,
             };
-
-            // Validación de JID (Sin cambios)
             if (!/^\d{7,15}@s\.whatsapp\.net$/.test(senderJid)) {
                  console.warn(`[WHATSAPP:${channelId}] JID inválido para chat nuevo: ${senderJid}`);
                  return;
             }
-
 			chatDocRef = await chatsRef.add(newChatData);
-            chatData = newChatData; // Usamos newChatData para la lógica siguiente
-
-            // Notificamos y enviamos bienvenida SOLO si se asignó un agente (es decir, dentro de horario)
+            chatData = newChatData;
             if (agentToAssign) {
                 console.log(`[ASIGNACIÓN] Nuevo chat de ${pushName} (${departmentName}) asignado a ${agentToAssign}`);
                 io.emit('new_chat_assigned', { chatId: chatDocRef.id, agentEmail: agentToAssign });
-
-                // Lógica de Mensaje de Bienvenida (Solo Atención al Cliente)
                 if (botSettings.welcomeEnabled && botSettings.welcomeMessage && departmentName === 'Atención al Cliente') {
                      try {
                          await sock.sendMessage(senderJid, { text: botSettings.welcomeMessage });
@@ -650,20 +639,17 @@ async function handleWhatsAppMessages(sock, channelId, m) {
 
         // --- LÓGICA PARA CHAT EXISTENTE (else) ---
         } else {
+            // ... (lógica de 'else' (chat existente) sin cambios) ...
             chatDocRef = chatQuery.docs[0].ref;
             chatData = chatQuery.docs[0].data();
-
-            // Lógica de Reasignación por Agente Ausente (Sin cambios)
             if (chatData.agentEmail) {
                 const agentQuery = await db.collection('agents').where('email', '==', chatData.agentEmail).limit(1).get();
                 if (!agentQuery.empty && agentQuery.docs[0].data().status === 'Ausente') {
                     await chatDocRef.update({ agentEmail: null });
-                    chatData.agentEmail = null; // Actualizar variable local
+                    chatData.agentEmail = null;
                     console.log(`[REASIGNACIÓN] Chat ${chatDocRef.id} desasignado del agente ausente.`);
                 }
             }
-
-            // Lógica de Asignación si el chat no tiene agente (Sin cambios)
 		    const needsAssignment = !chatData.agentEmail && chatData.status === 'Abierto';
 			if (needsAssignment) {
 			    const agentToAssign = await findNextAvailableAgent(departmentId);
@@ -673,21 +659,21 @@ async function handleWhatsAppMessages(sock, channelId, m) {
 				    io.emit('new_chat_assigned', { chatId: chatDocRef.id, agentEmail: agentToAssign });
 			    }
 		    }
-
-            // Actualizar datos del chat existente (Sin cambios)
             await chatDocRef.update({
-                status: 'Abierto', // Reabre el chat si estaba cerrado
+                status: 'Abierto',
                 lastMessage: lastMessageTextForDb,
                 lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
                 lastMessageSender: 'contact',
-                departmentIds: admin.firestore.FieldValue.arrayUnion(departmentId) // Asegura que el depto esté (aunque ya debería)
+                departmentIds: admin.firestore.FieldValue.arrayUnion(departmentId)
             });
         }
+        // --- FIN LÓGICA CHAT EXISTENTE ---
 
+        // Guardar el mensaje entrante en la subcolección (Siempre)
         await db.collection('chats').doc(chatDocRef.id).collection('messages').add(messageForDb);
 
-    } 
-} 
+    } // Fin del else (mensaje entrante de cliente)
+} // Fin de la función handleWhatsAppMessages
 
 // --- LÓGICA DE HORARIOS, BOT, ETC. ---
 let botSettings = { isEnabled: true, awayMessage: 'Gracias por escribirnos. Nuestro horario de atención ha finalizado por hoy. Te responderemos tan pronto como nuestro equipo esté de vuelta.', schedule: [], welcomeEnabled: false, welcomeMessage: '', closingEnabled: false, closingMessage: '', closingDelay: '10' };
@@ -862,8 +848,13 @@ io.on('connection', (socket) => {
         });
     });
 	
+    // Archivo: server.js -> Reemplaza este listener completo
+
     socket.on('enviar_mensaje', async (data) => {
-        const { chatId, message, agentEmail, fileUrl, fileName, fileType } = data;
+        // --- INICIO: Modificación para Citar ---
+        // 1. De-estructuramos 'quotedMessage' (viene del frontend)
+        const { chatId, message, agentEmail, fileUrl, fileName, fileType, quotedMessage } = data;
+        // --- FIN: Modificación ---
         try {
             const chatDoc = await db.collection('chats').doc(chatId).get();
             if (!chatDoc.exists) { 
@@ -873,18 +864,68 @@ io.on('connection', (socket) => {
             const chatData = chatDoc.data();
             const recipientId = chatData.contactPhone || chatData.contactId;
 
+            // --- INICIO: Lógica para preparar la cita ---
+            let telegramOptions = {};
+            let baileysQuoteObject = null;
+            let firestoreQuotedMessage = null; // Para guardar en NUESTRO mensaje
+
+            // 2. Si el frontend envió un mensaje para citar
+            if (quotedMessage && quotedMessage.id) {
+                // Buscamos el mensaje ORIGINAL en Firestore para obtener su ID de plataforma
+                const originalMsgRef = db.collection('chats').doc(chatId).collection('messages').doc(quotedMessage.id);
+                const originalMsgDoc = await originalMsgRef.get();
+
+                if (originalMsgDoc.exists) {
+                    const originalMsgData = originalMsgDoc.data();
+                    
+                    // Preparamos el objeto para GUARDAR en nuestro Firestore
+                    firestoreQuotedMessage = {
+                        text: originalMsgData.text,
+                        sender: originalMsgData.sender,
+                        agentEmail: originalMsgData.agentEmail || null
+                        // (Podríamos añadir fileType/fileName aquí si quisiéramos)
+                    };
+
+                    // 3. Preparamos la opción para TELEGRAM
+                    if (chatData.platform === 'telegram' && originalMsgData.telegramMessageId) {
+                        telegramOptions.reply_to_message_id = originalMsgData.telegramMessageId;
+                    }
+
+                    // 4. Preparamos el objeto para WHATSAPP (Baileys)
+                    if (chatData.platform === 'whatsapp' && originalMsgData.waMessageId) {
+                        // Baileys necesita un objeto 'quoted' que simule el mensaje original
+                        baileysQuoteObject = {
+                            key: {
+                                remoteJid: recipientId,
+                                id: originalMsgData.waMessageId,
+                                fromMe: (originalMsgData.sender === 'agent')
+                            },
+                            message: {
+                                // Rellenamos con el texto (o un placeholder si es un archivo)
+                                conversation: originalMsgData.text || (originalMsgData.fileName ? `📎 ${originalMsgData.fileName}` : '...')
+                            }
+                        };
+                    }
+                } else {
+                    console.warn(`[CITAR] No se encontró el mensaje original ${quotedMessage.id} para citar.`);
+                }
+            }
+            // --- FIN: Lógica para preparar la cita ---
+
+
             if (chatData.platform === 'telegram') {
                 if (bot) {
                     const caption = message || '';
                     if (fileUrl) {
-                        if (fileType.startsWith('image/')) { await bot.telegram.sendPhoto(recipientId, { url: fileUrl }, { caption }); }
-                        else if (fileType.startsWith('video/')) { await bot.telegram.sendVideo(recipientId, { url: fileUrl }, { caption }); }
-                        else if (fileType.startsWith('audio/')) { await bot.telegram.sendAudio(recipientId, { url: fileUrl }, { caption }); }
-                        else { await bot.telegram.sendDocument(recipientId, { url: fileUrl, filename: fileName }, { caption }); }
+                        // 5. Añadimos ...telegramOptions a todas las llamadas de envío
+                        if (fileType.startsWith('image/')) { await bot.telegram.sendPhoto(recipientId, { url: fileUrl }, { caption, ...telegramOptions }); }
+                        else if (fileType.startsWith('video/')) { await bot.telegram.sendVideo(recipientId, { url: fileUrl }, { caption, ...telegramOptions }); }
+                        else if (fileType.startsWith('audio/')) { await bot.telegram.sendAudio(recipientId, { url: fileUrl }, { caption, ...telegramOptions }); }
+                        else { await bot.telegram.sendDocument(recipientId, { url: fileUrl, filename: fileName }, { caption, ...telegramOptions }); }
                     } else {
-                        await bot.telegram.sendMessage(recipientId, message);
+                        await bot.telegram.sendMessage(recipientId, message, telegramOptions);
                     }
-                    console.log(`[TELEGRAM] Mensaje enviado a ${recipientId}`);
+                    console.log(`[TELEGRAM] Mensaje enviado a ${recipientId} (Cita: ${!!telegramOptions.reply_to_message_id})`);
                 } else {
                     socket.emit('envio_fallido', { chatId, error: 'El bot de Telegram no está conectado.' });
                 }
@@ -899,30 +940,34 @@ io.on('connection', (socket) => {
 				}
 
 				try {
-                    let sentMessage;
+                    // --- INICIO: Modificación Lógica de Envío WhatsApp ---
+                    // 6. Construimos el contenido del mensaje primero
+                    let content;
                     const caption = message || '';
 					if (fileUrl) {
-                        let content;
-						if (fileType.startsWith('image/')) {
-						    content = { image: { url: fileUrl }, caption };
-					    } else if (fileType.startsWith('video/')) {
-						    content = { video: { url: fileUrl }, caption };
-					    } else if (fileType.startsWith('audio/')) {
-						    content = { audio: { url: fileUrl }, mimetype: fileType };
-					    } else {
-						    content = { document: { url: fileUrl }, fileName: fileName };
-					    }
-                        sentMessage = await client.sendMessage(recipientId, content);
+                        if (fileType.startsWith('image/')) { content = { image: { url: fileUrl }, caption }; }
+                        else if (fileType.startsWith('video/')) { content = { video: { url: fileUrl }, caption }; }
+                        else if (fileType.startsWith('audio/')) { content = { audio: { url: fileUrl }, mimetype: fileType }; }
+                        else { content = { document: { url: fileUrl }, fileName: fileName }; }
 				    } else {
-					    sentMessage = await client.sendMessage(recipientId, { text: message });
+					    content = { text: message };
 				    }
+
+                    // 7. Añadimos el objeto 'quoted' si existe
+                    if (baileysQuoteObject) {
+                        content.quoted = baileysQuoteObject;
+                    }
+
+                    // 8. Enviamos el mensaje construido
+                    const sentMessage = await client.sendMessage(recipientId, content);
+                    // --- FIN: Modificación Lógica de Envío WhatsApp ---
 
                     if (sentMessage) {
                         crmSentMessageIds.add(sentMessage.key.id);
                         setTimeout(() => crmSentMessageIds.delete(sentMessage.key.id), 60000);
                     }
 
-				    console.log(`[WHATSAPP] Mensaje enviado a ${recipientId}`);
+				    console.log(`[WHATSAPP] Mensaje enviado a ${recipientId} (Cita: ${!!baileysQuoteObject})`);
 			    } catch (err) {
 				    console.error(`[WHATSAPP] Error al enviar mensaje:`, err.message);
 				    await db.collection('failedMessages').add({
@@ -934,9 +979,21 @@ io.on('connection', (socket) => {
 		    }
 
             const lastMessageText = message || fileName || 'Archivo adjunto';
+            
+            // --- INICIO: Modificación Guardado en Firestore ---
+            // 9. Añadimos el campo 'quotedMessage' (que será null si no hay cita)
             await db.collection('chats').doc(chatId).collection('messages').add({
-                text: lastMessageText, sender: 'agent', agentEmail, timestamp: admin.firestore.FieldValue.serverTimestamp(), fileUrl: fileUrl || null, fileName: fileName || null,
+                text: lastMessageText,
+                sender: 'agent',
+                agentEmail,
+                timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                fileUrl: fileUrl || null,
+                fileName: fileName || null,
+                status: 'sent', // Asumimos 'sent'
+                quotedMessage: firestoreQuotedMessage // <-- AÑADIDO
             });
+            // --- FIN: Modificación Guardado en Firestore ---
+
             await db.collection('chats').doc(chatId).update({
                 lastMessage: lastMessageText, 
                 lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
