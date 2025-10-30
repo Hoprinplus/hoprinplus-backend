@@ -49,6 +49,8 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 
 const whatsappClients = {};
 const channelStates = {};
 
+// Archivo: server.js -> Reemplaza esta función completa
+
 async function connectToWhatsApp(channelId, isAutoReconnect = false) {
     if (channelStates[channelId]?.status === 'CONNECTING' || whatsappClients[channelId]) {
         console.log(`[WHATSAPP:${channelId}] Proceso de conexión ya en curso o canal ya conectado.`);
@@ -151,6 +153,48 @@ async function connectToWhatsApp(channelId, isAutoReconnect = false) {
 
         sock.ev.on('creds.update', saveCreds);
         sock.ev.on('messages.upsert', (m) => handleWhatsAppMessages(sock, channelId, m));
+
+        // --- INICIO DE LA MODIFICACIÓN (Listener de Reacciones) ---
+        sock.ev.on('messages.reaction', async (reactionData) => {
+            try {
+                const { reaction, key } = reactionData.messages[0];
+                const reactionEmoji = reaction.text;
+                
+                // Ignorar si no es una reacción que nos interesa
+                if (!['👍', '👎'].includes(reactionEmoji)) {
+                    return;
+                }
+                
+                // El ID del mensaje al que se reaccionó
+                const reactedMessageId = key.id; 
+                
+                // Buscar si este ID de mensaje coincide con un 'ratingMessageId' en algún chat
+                const chatsRef = db.collection('chats');
+                const chatQuery = await chatsRef
+                    .where('ratingMessageId', '==', reactedMessageId)
+                    .limit(1)
+                    .get();
+
+                if (!chatQuery.empty) {
+                    const chatDoc = chatQuery.docs[0];
+                    const chatId = chatDoc.id;
+                    const ratingValue = (reactionEmoji === '👍') ? 'positive' : 'negative';
+
+                    // Actualizar el chat con la calificación y borrar el ID para evitar duplicados
+                    await chatDoc.ref.update({
+                        rating: ratingValue, // Guardamos 'positive' o 'negative'
+                        ratingMessageId: null, // Limpiamos el ID
+                        ratingPending: false // Marcamos como calificado
+                    });
+                    
+                    console.log(`[CALIFICACIÓN] Calificación '${ratingValue}' registrada para el chat ${chatId}.`);
+                }
+            } catch (error) {
+                console.error(`[CALIFICACIÓN] Error al procesar reacción de WhatsApp:`, error);
+            }
+        });
+        // --- FIN DE LA MODIFICACIÓN ---
+
 
     } catch (error) {
         console.error(`[WHATSAPP:${channelId}] Error crítico durante la inicialización:`, error);
@@ -307,6 +351,8 @@ async function processTelegramMessage(ctx, messageData) {
     });
 }
 
+// Archivo: server.js -> Reemplaza esta función completa
+
 async function handleTelegramMedia(ctx, fileId, mimeType, originalFileName, lastMessageText) {
     try {
         const fileLink = await ctx.telegram.getFileLink(fileId);
@@ -321,17 +367,41 @@ async function handleTelegramMedia(ctx, fileId, mimeType, originalFileName, last
         await fileRef.makePublic();
         const downloadURL = fileRef.publicUrl();
 
+        // --- INICIO DE LA MODIFICACIÓN (Opción C - Telegram Media) ---
+        // Construimos el objeto dbMessage primero
+        const dbMessage = {
+            text: ctx.message.caption || '',
+            fileUrl: downloadURL,
+            fileType: mimeType,
+            fileName: originalFileName
+        };
+
+        // Revisamos si es una respuesta
+        if (ctx.message.reply_to_message && bot.botInfo) {
+            try {
+                const quotedMsg = ctx.message.reply_to_message;
+                const quotedText = quotedMsg.text || quotedMsg.caption || (quotedMsg.document ? `📄 ${quotedMsg.document.file_name}` : (quotedMsg.photo ? '🖼️ Imagen' : 'Mensaje adjunto'));
+                const quotedSender = (quotedMsg.from.id === bot.botInfo.id) ? 'agent' : 'contact';
+                
+                dbMessage.quotedMessage = {
+                    text: quotedText,
+                    sender: quotedSender
+                };
+            } catch (quoteError) {
+                 console.error(`[TELEGRAM] Error al procesar quotedMessage multimedia:`, quoteError.message);
+            }
+        }
+
+        // Enviamos el objeto dbMessage completo
         await processTelegramMessage(ctx, {
             lastMessage: lastMessageText,
-            dbMessage: {
-                text: ctx.message.caption || '',
-                fileUrl: downloadURL,
-                fileType: mimeType,
-                fileName: originalFileName
-            }
+            dbMessage: dbMessage 
         });
+        // --- FIN DE LA MODIFICACIÓN ---
+
     } catch (error) {
-        console.error(`[TELEGRAM] Error procesando archivo (${originalFileName}):`, error);
+        // (El logging de error que añadimos en el paso anterior)
+        console.error(`[TELEGRAM] Error procesando archivo (${originalFileName}) de contactId ${ctx.message.from.id}:`, error.message, error.stack);
     }
 }
 
@@ -339,10 +409,32 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_BOT_TOKEN !== 'DISABLED') {
     bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
     bot.on('text', async (ctx) => {
-        await processTelegramMessage(ctx, {
+        // 1. Preparamos el objeto messageData
+        const messageData = {
             lastMessage: ctx.message.text,
             dbMessage: { text: ctx.message.text }
-        });
+        };
+        
+        // 2. Revisamos si es una respuesta y MODIFICAMOS messageData si es necesario
+        if (ctx.message.reply_to_message && bot.botInfo) {
+            try {
+                const quotedMsg = ctx.message.reply_to_message;
+                const quotedText = quotedMsg.text || quotedMsg.caption || (quotedMsg.document ? `📄 ${quotedMsg.document.file_name}` : (quotedMsg.photo ? '🖼️ Imagen' : 'Mensaje adjunto'));
+                const quotedSender = (quotedMsg.from.id === bot.botInfo.id) ? 'agent' : 'contact';
+                
+                // Añadimos la cita al objeto dbMessage existente
+                messageData.dbMessage.quotedMessage = {
+                    text: quotedText,
+                    sender: quotedSender
+                };
+            } catch (quoteError) {
+                console.error(`[TELEGRAM] Error al procesar quotedMessage de texto:`, quoteError.message);
+            }
+        }
+        
+        // 3. Llamamos a processTelegramMessage UNA SOLA VEZ, al final,
+        // usando el objeto messageData (que puede o no tener una cita).
+        await processTelegramMessage(ctx, messageData);
     });
 
     bot.on('photo', async (ctx) => {
@@ -375,7 +467,7 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_BOT_TOKEN !== 'DISABLED') {
     console.warn("[TELEGRAM] Token no válido o desactivado. El conector de Telegram no se iniciará.");
 }
 
-// Archivo: server.js -> Reemplaza esta función completa
+// Archivo: server.js -> Reemplaza esta función completa (Líneas ~377 a ~583)
 
 async function handleWhatsAppMessages(sock, channelId, m) {
     const msg = m.messages[0];
@@ -393,7 +485,8 @@ async function handleWhatsAppMessages(sock, channelId, m) {
     const messageType = Object.keys(msg.message)[0];
     const messageContent = msg.message[messageType];
     const senderJid = msg.key.remoteJid;
-	
+
+    // --- Rate Limiting y Validación de JID (Sin cambios) ---
 	if (messageRateTracker[senderJid]) {
         messageRateTracker[senderJid] = messageRateTracker[senderJid].filter(ts => Date.now() - ts < RATE_LIMIT_WINDOW_MS);
         messageRateTracker[senderJid].push(Date.now());
@@ -404,19 +497,40 @@ async function handleWhatsAppMessages(sock, channelId, m) {
     } else {
         messageRateTracker[senderJid] = [Date.now()];
     }
-	
 	if (!senderJid || !senderJid.endsWith('@s.whatsapp.net')) {
         console.warn(`[WHATSAPP:${channelId}] Ignorando mensaje de origen no válido: ${senderJid}`);
         return;
 	}
+    // --- Fin Rate Limiting ---
 
     const messageText = (msg.message.conversation || msg.message.extendedTextMessage?.text || messageContent.caption || '').trim();
     let lastMessageTextForDb = messageText;
-    let messageForDb = { 
-        text: messageText, 
+    let messageForDb = {
+        text: messageText,
         timestamp: admin.firestore.FieldValue.serverTimestamp()
     };
-    
+
+    // --- Captura de Citas (Sin cambios) ---
+	const contextInfo = messageContent?.contextInfo;
+    if (contextInfo?.quotedMessage) {
+        try {
+            const quotedMsg = contextInfo.quotedMessage;
+            const quotedSenderJid = contextInfo.participant;
+            const quotedSender = (quotedSenderJid === sock.user.id) ? 'agent' : 'contact'; // Comparar directamente con sock.user.id
+            const quotedText = quotedMsg.conversation ||
+                               quotedMsg.extendedTextMessage?.text ||
+                               (quotedMsg.imageMessage?.caption) ||
+                               (quotedMsg.videoMessage?.caption) ||
+                               (quotedMsg.documentMessage?.fileName) ||
+                               (quotedMsg.audioMessage ? '🎤 Audio' : 'Archivo adjunto');
+            messageForDb.quotedMessage = { text: quotedText, sender: quotedSender };
+        } catch (quoteError) {
+            console.error(`[WHATSAPP:${channelId}] Error al procesar quotedMessage:`, quoteError.message);
+        }
+    }
+    // --- Fin Captura de Citas ---
+
+    // --- Procesamiento de Archivos Multimedia (Sin cambios, incluye logging mejorado) ---
     const mediaTypes = { 'audioMessage': { type: 'audio', ext: 'ogg', defaultName: 'Mensaje de voz', icon: '🎤' }, 'imageMessage': { type: 'image', ext: 'jpg', defaultName: 'Imagen', icon: '🖼️' }, 'videoMessage': { type: 'video', ext: 'mp4', defaultName: 'Video', icon: '📹' }, 'documentMessage': { type: 'document', ext: 'pdf', defaultName: 'Documento', icon: '📄' } };
     if (mediaTypes[messageType]) {
         const mediaInfo = mediaTypes[messageType];
@@ -436,12 +550,19 @@ async function handleWhatsAppMessages(sock, channelId, m) {
                 messageForDb.fileType = messageContent.mimetype || 'application/octet-stream';
                 messageForDb.fileName = originalName;
             } catch (mediaError) {
-                console.error(`[${mediaInfo.type.toUpperCase()}:${channelId}] Error al procesar archivo entrante:`, mediaError);
-                lastMessageTextForDb = `⚠️ Error al procesar ${mediaInfo.defaultName.toLowerCase()}`;
+                console.error(`[${mediaInfo.type.toUpperCase()}:${channelId}] Error procesando archivo entrante para msg ID ${msg.key.id}:`, mediaError.message, mediaError.stack);
+                lastMessageTextForDb = `⚠️ Error procesando ${mediaInfo.defaultName.toLowerCase()}`;
+                messageForDb.fileUrl = null;
+                messageForDb.fileType = messageContent.mimetype || 'application/octet-stream';
+                messageForDb.fileName = originalName;
+                messageForDb.text = `Error al procesar: ${originalName || mediaInfo.defaultName}`;
             }
         }
     }
+    // --- Fin Procesamiento Multimedia ---
 
+
+    // --- Sincronización de mensajes enviados desde el teléfono (Sin cambios) ---
     if (msg.key.fromMe) {
         const chatQuery = await db.collection('chats').where('contactPhone', '==', senderJid).limit(1).get();
         if (!chatQuery.empty) {
@@ -452,101 +573,205 @@ async function handleWhatsAppMessages(sock, channelId, m) {
             await db.collection('chats').doc(chatDoc.id).collection('messages').add(messageForDb);
             await chatDoc.ref.update({ lastMessage: lastMessageTextForDb, lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(), lastMessageSender: 'agent' });
         }
-    } else {
+    // --- Fin Sincronización Teléfono ---
+
+    } else { // Mensaje entrante de un cliente
         const pushName = msg.pushName || senderJid;
         const chatsRef = db.collection('chats');
-        
-        // --- INICIO DE LA CORRECCIÓN CLAVE ---
-        // Ahora buscamos un chat que coincida con el teléfono Y el departamento actual.
+
+        // Buscar chat existente para este teléfono Y departamento
         const chatQuery = await chatsRef.where('contactPhone', '==', senderJid).where('departmentIds', 'array-contains', departmentId).limit(1).get();
-        // --- FIN DE LA CORRECCIÓN CLAVE ---
 
         let chatDocRef;
         let chatData;
-        
         messageForDb.sender = 'contact';
 
+        // --- LÓGICA PARA CHAT NUEVO (if chatQuery.empty) ---
         if (chatQuery.empty) {
-            if (!botSettings.isEnabled) return;
-            if (!isWithinOfficeHours()) {
-                if (botSettings.awayEnabled && botSettings.awayMessage) { await sock.sendMessage(senderJid, { text: botSettings.awayMessage }); }
-                return;
+            const deptDoc = await db.collection('departments').doc(departmentId).get();
+            const departmentName = deptDoc.exists ? deptDoc.data().name : null;
+            let agentToAssign = null; // Por defecto no se asigna agente
+
+            // Verificamos si estamos DENTRO del horario laboral
+            const withinOfficeHours = isWithinOfficeHours();
+
+            // Lógica de Mensaje de Ausente (Solo Atención al Cliente)
+            if (!withinOfficeHours && botSettings.awayEnabled && botSettings.awayMessage && departmentName === 'Atención al Cliente') {
+                 try {
+                     await sock.sendMessage(senderJid, { text: botSettings.awayMessage });
+                     console.log(`[WHATSAPP:${channelId}] Mensaje de ausente enviado a ${senderJid} (Atención Cliente).`);
+                 } catch (awayMsgError) {
+                     console.error(`[WHATSAPP:${channelId}] Error enviando mensaje de ausente:`, awayMsgError);
+                 }
             }
-            const agentToAssign = await findNextAvailableAgent(departmentId);
+
+            // SOLO asignamos agente si estamos DENTRO del horario laboral
+            if (withinOfficeHours) {
+                agentToAssign = await findNextAvailableAgent(departmentId);
+            } else {
+                 console.log(`[WHATSAPP:${channelId}] Chat nuevo de ${pushName} recibido fuera de horario. No se asignará agente.`);
+            }
+
+            // Creamos el chat (SIEMPRE, incluso fuera de horario)
             const newChatData = {
                 contactName: pushName, contactPhone: senderJid, internalId: `WA-${Date.now().toString().slice(-6)}`,
                 departmentIds: [departmentId], platform: 'whatsapp', status: 'Abierto', createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 lastMessage: lastMessageTextForDb, lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
                 lastMessageSender: 'contact',
-                agentEmail: agentToAssign,
-                isBotActive: false, 
-                botState: {}
+                agentEmail: agentToAssign, // Puede ser null si es fuera de horario
+                isBotActive: false,
             };
-            if (!/^\d{7,15}@s\.whatsapp\.net$/.test(senderJid)) { return; }
+
+            // Validación de JID (Sin cambios)
+            if (!/^\d{7,15}@s\.whatsapp\.net$/.test(senderJid)) {
+                 console.warn(`[WHATSAPP:${channelId}] JID inválido para chat nuevo: ${senderJid}`);
+                 return;
+            }
+
 			chatDocRef = await chatsRef.add(newChatData);
-            chatData = newChatData;
+            chatData = newChatData; // Usamos newChatData para la lógica siguiente
+
+            // Notificamos y enviamos bienvenida SOLO si se asignó un agente (es decir, dentro de horario)
             if (agentToAssign) {
-                console.log(`[ASIGNACIÓN] Nuevo chat de ${pushName} asignado a ${agentToAssign}`);
+                console.log(`[ASIGNACIÓN] Nuevo chat de ${pushName} (${departmentName}) asignado a ${agentToAssign}`);
                 io.emit('new_chat_assigned', { chatId: chatDocRef.id, agentEmail: agentToAssign });
-                if (botSettings.welcomeEnabled && botSettings.welcomeMessage) {
-                    await sock.sendMessage(senderJid, { text: botSettings.welcomeMessage });
+
+                // Lógica de Mensaje de Bienvenida (Solo Atención al Cliente)
+                if (botSettings.welcomeEnabled && botSettings.welcomeMessage && departmentName === 'Atención al Cliente') {
+                     try {
+                         await sock.sendMessage(senderJid, { text: botSettings.welcomeMessage });
+                         console.log(`[WHATSAPP:${channelId}] Mensaje de bienvenida enviado a ${senderJid} (Atención Cliente).`);
+                     } catch (welcomeMsgError) {
+                         console.error(`[WHATSAPP:${channelId}] Error enviando mensaje de bienvenida:`, welcomeMsgError);
+                     }
                 }
             }
-            if (newChatData.isBotActive) {
-                const startNode = activeBotFlow.nodes.find(n => n.type === 'start');
-                if (startNode) { await executeNode(startNode, sock, senderJid, chatDocRef); }
-            }
+        // --- FIN LÓGICA CHAT NUEVO ---
+
+        // --- LÓGICA PARA CHAT EXISTENTE (else) ---
         } else {
             chatDocRef = chatQuery.docs[0].ref;
             chatData = chatQuery.docs[0].data();
+
+            // Lógica de Reasignación por Agente Ausente (Sin cambios)
             if (chatData.agentEmail) {
                 const agentQuery = await db.collection('agents').where('email', '==', chatData.agentEmail).limit(1).get();
                 if (!agentQuery.empty && agentQuery.docs[0].data().status === 'Ausente') {
                     await chatDocRef.update({ agentEmail: null });
-                    chatData.agentEmail = null;
+                    chatData.agentEmail = null; // Actualizar variable local
                     console.log(`[REASIGNACIÓN] Chat ${chatDocRef.id} desasignado del agente ausente.`);
                 }
             }
+
+            // Lógica de Asignación si el chat no tiene agente (Sin cambios)
 		    const needsAssignment = !chatData.agentEmail && chatData.status === 'Abierto';
 			if (needsAssignment) {
 			    const agentToAssign = await findNextAvailableAgent(departmentId);
 			    if (agentToAssign) {
 				    await chatDocRef.update({ agentEmail: agentToAssign });
-				    console.log(`[ASIGNACIÓN] Chat respondido por cliente, asignado a ${agentToAssign}`);
+				    console.log(`[ASIGNACIÓN] Chat ${chatDocRef.id} respondido por cliente, asignado a ${agentToAssign}`);
 				    io.emit('new_chat_assigned', { chatId: chatDocRef.id, agentEmail: agentToAssign });
 			    }
 		    }
-            await chatDocRef.update({ 
-                status: 'Abierto', 
-                lastMessage: lastMessageTextForDb, 
+
+            // Actualizar datos del chat existente (Sin cambios)
+            await chatDocRef.update({
+                status: 'Abierto', // Reabre el chat si estaba cerrado
+                lastMessage: lastMessageTextForDb,
                 lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
                 lastMessageSender: 'contact',
-                departmentIds: admin.firestore.FieldValue.arrayUnion(departmentId) 
+                departmentIds: admin.firestore.FieldValue.arrayUnion(departmentId) // Asegura que el depto esté (aunque ya debería)
             });
         }
+
         await db.collection('chats').doc(chatDocRef.id).collection('messages').add(messageForDb);
-        if (chatData.isBotActive && messageText) {
-            await processBotMessage(chatDocRef, chatData, messageText, sock);
-        }
-        if (chatData.ratingPending && /^[1-5]$/.test(messageText)) {
-            await chatDocRef.update({ rating: parseInt(messageText, 10), ratingPending: false });
-            await sock.sendMessage(senderJid, { text: '¡Gracias por tu calificación! 🙌' });
-        }
-    }
-}
+
+    } 
+} 
 
 // --- LÓGICA DE HORARIOS, BOT, ETC. ---
 let botSettings = { isEnabled: true, awayMessage: 'Gracias por escribirnos. Nuestro horario de atención ha finalizado por hoy. Te responderemos tan pronto como nuestro equipo esté de vuelta.', schedule: [], welcomeEnabled: false, welcomeMessage: '', closingEnabled: false, closingMessage: '', closingDelay: '10' };
 const settingsRef = db.collection('settings').doc('bot');
 settingsRef.onSnapshot(doc => { if (doc.exists) { botSettings = { ...botSettings, ...doc.data() }; console.log("[Settings] Configuración del bot actualizada en tiempo real."); } else { console.log("[Settings] No se encontró configuración del bot, usando valores por defecto."); } });
 
-let activeBotFlow = { nodes: [{ id: 'start', type: 'start', content: 'Inicio del Flujo' }], edges: [] };
-const botFlowRef = db.collection('bot_flows').doc('default_welcome');
-botFlowRef.onSnapshot(doc => { if (doc.exists) { activeBotFlow = doc.data(); console.log("[Bot Flow] Flujo del bot actualizado desde Firestore."); } else { console.log("[Bot Flow] No se encontró flujo en Firestore, usando el flujo por defecto codificado."); } });
+function isWithinOfficeHours() {
+    // Si no hay configuración de horarios, o el array está vacío, se asume que siempre está abierto.
+    if (!botSettings.schedule || botSettings.schedule.length === 0) {
+        return true;
+    }
 
-async function executeNode(node, sock, senderJid, chatDocRef) { /* ... Tu lógica ... */ }
-async function processBotMessage(chatDocRef, chatData, messageText, sock) { /* ... Tu lógica ... */ }
-function isWithinOfficeHours() { /* ... Tu lógica ... */ return true; }
+    try {
+        const now = new Date();
+        const timeZone = 'America/Caracas'; // Zona horaria de Venezuela (UTC-4)
+
+        // Mapeo de días de Intl (en inglés) a los valores de nuestra BD (en español)
+        const dayMap = {
+            'Monday': 'Lunes',
+            'Tuesday': 'Martes',
+            'Wednesday': 'Miércoles',
+            'Thursday': 'Jueves',
+            'Friday': 'Viernes',
+            'Saturday': 'Sábado',
+            'Sunday': 'Domingo'
+        };
+
+        // Obtener el nombre del día de la semana en la zona horaria de Venezuela
+        const formatterDay = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'long' });
+        const dayName = formatterDay.format(now); // e.g., "Monday"
+        const currentDayName = dayMap[dayName]; // e.g., "Lunes"
+        
+        // Determinar si es un día de semana para la regla "Lunes a Viernes"
+        const isWeekday = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes'].includes(currentDayName);
+
+        // Obtener la hora y minuto actual en la zona horaria de Venezuela
+        const formatterHour = new Intl.DateTimeFormat('en-US', { timeZone, hour: '2-digit', hour12: false });
+        let currentHour = parseInt(formatterHour.format(now)); // 0-23
+        
+        // Corrección para las 24:00 (que Intl puede devolver como "24" en lugar de "00")
+        if (currentHour === 24) currentHour = 0;
+
+        const formatterMinute = new Intl.DateTimeFormat('en-US', { timeZone, minute: '2-digit' });
+        const currentMinute = parseInt(formatterMinute.format(now)); // 0-59
+
+        // Convertir la hora actual a un número comparable, ej: 9:30 -> 930
+        const currentTime = currentHour * 100 + currentMinute;
+
+        // Iterar sobre las reglas de horario definidas en el panel de admin
+        for (const rule of botSettings.schedule) {
+            // rule = { day: 'Lunes a Viernes', start: '09:00', end: '17:00' }
+            
+            let isDayMatch = false;
+
+            if (rule.day === 'Todos los días') {
+                isDayMatch = true;
+            } else if (rule.day === 'Lunes a Viernes' && isWeekday) {
+                isDayMatch = true;
+            } else if (currentDayName === rule.day) { // Compara 'Sábado' con 'Sábado' o 'Domingo' con 'Domingo'
+                isDayMatch = true;
+            }
+
+            if (isDayMatch) {
+                // Convertir los tiempos de la regla a números, ej: '09:00' -> 900
+                const startTime = parseInt(rule.start.replace(':', ''));
+                const endTime = parseInt(rule.end.replace(':', ''));
+
+                // Comprobar si la hora actual está DENTRO del rango
+                // El rango es inclusivo en el inicio y exclusivo en el fin (ej: hasta las 17:00 significa 16:59:59)
+                if (currentTime >= startTime && currentTime < endTime) {
+                    return true; // Se encontró una regla válida. Estamos en horario de oficina.
+                }
+            }
+        }
+
+        // Si el bucle termina sin encontrar una regla, estamos fuera de horario.
+        return false;
+
+    } catch (error) {
+        console.error("Error al verificar las horas de oficina:", error);
+        // En caso de error, asumir que estamos abiertos para no bloquear a los clientes.
+        return true;
+    }
+}
 
 
 const lastAssignedAgentIndex = {};
@@ -724,89 +949,336 @@ io.on('connection', (socket) => {
     });
 
     socket.on('iniciar_nuevo_chat', async (data) => {
-        const { recipientNumber, name, channelId, initialMessage, agentEmail, departmentId } = data;
-        console.log(`[OUTBOUND] Solicitud para iniciar chat/crear contacto con ${recipientNumber}`);
-    
-        if (!recipientNumber || !name || !departmentId) {
-            return socket.emit('envio_fallido', { error: "Faltan datos (nombre, teléfono, departamento) para crear el contacto." });
-        }
-        const formattedNumber = `${recipientNumber.replace(/\D/g, '')}@s.whatsapp.net`;
-        if (!/^\d{10,15}@s\.whatsapp\.net$/.test(formattedNumber)) {
-             return socket.emit('envio_fallido', { error: "El número de teléfono no es válido." });
-        }
-        
-        try {
-            const chatsRef = db.collection('chats');
-            let chatQuery = await chatsRef.where('contactPhone', '==', formattedNumber).limit(1).get();
-            let chatId;
-    
-            if (chatQuery.empty) {
-                console.log(`[OUTBOUND] Creando nuevo chat/contacto para ${formattedNumber}`);
-                const newChatData = {
-                    contactName: name,
-                    contactPhone: formattedNumber,
-                    internalId: `WA-${Date.now().toString().slice(-6)}`,
-                    departmentIds: [departmentId],
-                    platform: 'whatsapp',
-                    status: initialMessage && channelId ? 'Abierto' : 'Cerrado', // Si no hay mensaje, se crea como cerrado
-                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                    lastMessage: initialMessage || 'Contacto creado.',
-                    lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
-                    lastMessageSender: initialMessage && channelId ? 'agent' : null,
-                    agentEmail: agentEmail,
-                    isBotActive: false,
-                };
-                const chatDocRef = await chatsRef.add(newChatData);
-                chatId = chatDocRef.id;
-            } else {
-                console.log(`[OUTBOUND] El chat con ${formattedNumber} ya existe. Actualizando...`);
-                chatId = chatQuery.docs[0].id;
-                await chatQuery.docs[0].ref.update({
-                    status: 'Abierto',
-                    agentEmail: agentEmail,
-                    lastMessage: initialMessage || 'Chat actualizado.',
-                    lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
-                    lastMessageSender: initialMessage && channelId ? 'agent' : null,
-                });
+    const { recipientNumber, name, channelId, initialMessage, agentEmail, departmentId } = data;
+    console.log(`[OUTBOUND] Solicitud para iniciar chat/crear contacto con ${recipientNumber}`);
 
+    if (!recipientNumber || !name || !departmentId) {
+        return socket.emit('envio_fallido', { error: "Faltan datos (nombre, teléfono, departamento) para crear el contacto." });
+    }
+    const formattedNumber = `${recipientNumber.replace(/\D/g, '')}@s.whatsapp.net`;
+    if (!/^\d{10,15}@s\.whatsapp\.net$/.test(formattedNumber)) {
+        return socket.emit('envio_fallido', { error: "El número de teléfono no es válido." });
+    }
+
+    try {
+        const chatsRef = db.collection('chats');
+        
+        // ---
+        // --- ¡AQUÍ ESTÁ EL CAMBIO! ---
+        // ---
+        // Se añade .where('departmentIds', 'array-contains', departmentId)
+        // para buscar solo en el departamento que estás seleccionando.
+        let chatQuery = await chatsRef
+            .where('contactPhone', '==', formattedNumber)
+            .where('departmentIds', 'array-contains', departmentId)
+            .limit(1).get();
+        // ---
+        // --- ¡FIN DEL CAMBIO! ---
+        // ---
+
+        let chatId;
+
+        if (chatQuery.empty) {
+            console.log(`[OUTBOUND] Creando nuevo chat/contacto para ${formattedNumber} en el depto ${departmentId}`);
+            const newChatData = {
+                contactName: name,
+                contactPhone: formattedNumber,
+                internalId: `WA-${Date.now().toString().slice(-6)}`,
+                departmentIds: [departmentId],
+                platform: 'whatsapp',
+                status: initialMessage && channelId ? 'Abierto' : 'Cerrado', // Si no hay mensaje, se crea como cerrado
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                lastMessage: initialMessage || 'Contacto creado.',
+                lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+                lastMessageSender: initialMessage && channelId ? 'agent' : null,
+                agentEmail: agentEmail,
+                isBotActive: false,
+            };
+            const chatDocRef = await chatsRef.add(newChatData);
+            chatId = chatDocRef.id;
+        } else {
+            console.log(`[OUTBOUND] El chat con ${formattedNumber} ya existe en este depto. Actualizando...`);
+            chatId = chatQuery.docs[0].id;
+            await chatQuery.docs[0].ref.update({
+                status: 'Abierto',
+                agentEmail: agentEmail,
+                lastMessage: initialMessage || 'Chat actualizado.',
+                lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+                lastMessageSender: initialMessage && channelId ? 'agent' : null,
+            });
+        }
+
+        if (channelId && initialMessage) {
+            const client = whatsappClients[channelId];
+            if (!client) {
+                console.warn(`[OUTBOUND] El contacto ${chatId} fue creado/actualizado, pero no se envió mensaje porque el canal ${channelId} no está conectado.`);
+                socket.emit('nuevo_chat_iniciado', { chatId: chatId, message: 'Contacto creado, pero el canal no está conectado para enviar el mensaje.' });
+                return;
             }
+
+            const sentMessage = await client.sendMessage(formattedNumber, { text: initialMessage });
+
+            await db.collection('chats').doc(chatId).collection('messages').add({
+                text: initialMessage,
+                sender: 'agent',
+                agentEmail: agentEmail,
+                timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                status: 'sent'
+            });
+
+            if (sentMessage) {
+                crmSentMessageIds.add(sentMessage.key.id);
+            }
+
+            console.log(`[OUTBOUND] Mensaje inicial enviado a ${formattedNumber}`);
+        } else {
+            console.log(`[OUTBOUND] Contacto ${chatId} creado/actualizado sin enviar mensaje inicial.`);
+        }
+
+        socket.emit('nuevo_chat_iniciado', { chatId: chatId });
+
+    } catch (error) {
+        console.error(`[OUTBOUND] Error crítico al iniciar nuevo chat:`, error);
+        socket.emit('envio_fallido', { error: `Error del servidor: ${error.message}` });
+    }
+});
+
     
-            if (channelId && initialMessage) {
-                const client = whatsappClients[channelId];
-                if (!client) {
-                    console.warn(`[OUTBOUND] El contacto ${chatId} fue creado/actualizado, pero no se envió mensaje porque el canal ${channelId} no está conectado.`);
-                    socket.emit('nuevo_chat_iniciado', { chatId: chatId, message: 'Contacto creado, pero el canal no está conectado para enviar el mensaje.' });
-                    return;
-                }
+// Archivo: server.js -> Reemplaza este listener completo
+
+    socket.on('solicitar_calificacion', async ({ chatId }) => {
+        // 1. Verificar si la función está habilitada en la configuración
+        if (!botSettings.closingEnabled || !botSettings.closingMessage) {
+            console.log(`[CALIFICACIÓN] Función de cierre deshabilitada. No se enviará mensaje para el chat ${chatId}.`);
+            return; // No hacer nada si está deshabilitado
+        }
     
-                const sentMessage = await client.sendMessage(formattedNumber, { text: initialMessage });
-                
-                await db.collection('chats').doc(chatId).collection('messages').add({
-                    text: initialMessage,
-                    sender: 'agent',
-                    agentEmail: agentEmail,
-                    timestamp: admin.firestore.FieldValue.serverTimestamp(),
-                    status: 'sent' 
-                });
-    
-                if (sentMessage) {
-                    crmSentMessageIds.add(sentMessage.key.id);
-                }
-                
-                console.log(`[OUTBOUND] Mensaje inicial enviado a ${formattedNumber}`);
+        try {
+            // 2. Obtener los datos del chat Y el nombre del departamento
+            const chatDoc = await db.collection('chats').doc(chatId).get();
+            if (!chatDoc.exists) {
+                console.warn(`[CALIFICACIÓN] El chat ${chatId} no existe.`);
+                return;
+            }
+            const chatData = chatDoc.data();
+
+            
+            let departmentName = null;
+            if (chatData.departmentIds && chatData.departmentIds.length > 0) {
+               
+                 const atencionClienteId = 'atencion-al-cliente'; 
+                 const deptIdToCheck = chatData.departmentIds.includes(atencionClienteId)
+                                    ? atencionClienteId
+                                    : chatData.departmentIds[0]; // Si no lo incluye, usa el primero como fallback (aunque la lógica ahora debería detenerse)
+                 
+                 const deptDoc = await db.collection('departments').doc(deptIdToCheck).get();
+                 if (deptDoc.exists) {
+                     departmentName = deptDoc.data().name;
+                 } else {
+                     console.warn(`[CALIFICACIÓN] No se encontró el documento del departamento con ID ${deptIdToCheck} para el chat ${chatId}.`);
+                 }
             } else {
-                console.log(`[OUTBOUND] Contacto ${chatId} creado/actualizado sin enviar mensaje inicial.`);
+                console.warn(`[CALIFICACIÓN] El chat ${chatId} no tiene departmentIds definidos.`);
+            }
+
+            // Si no es del departamento de Atención al Cliente, no enviamos mensaje de cierre/calificación
+            if (departmentName !== 'Atención al Cliente') {
+                 console.log(`[CALIFICACIÓN] El chat ${chatId} (${departmentName || 'Sin Depto'}) no pertenece a Atención al Cliente. No se enviará mensaje de cierre.`);
+                 return; // Salimos de la función
+            }
+            // --- FIN DE LA MODIFICACIÓN ---
+
+            const recipientId = chatData.contactPhone || chatData.contactId; // JID/ID del cliente
+            let client;
+            let platform = chatData.platform;
+    
+            if (platform === 'whatsapp') {
+                const channel = await findChannelForChat(chatData); // Usamos la función que ya existe
+                client = channel && whatsappClients[channel.id];
+            } else if (platform === 'telegram') {
+                client = bot; // Usamos el bot de Telegraf
             }
     
-            socket.emit('nuevo_chat_iniciado', { chatId: chatId });
+            if (!client) {
+                console.warn(`[CALIFICACIÓN] No se encontró cliente conectado (${platform}) para el chat ${chatId}`);
+                return;
+            }
+            
+            // 4. Implementar el retraso (delay)
+            const delayInMinutes = parseInt(botSettings.closingDelay, 10) || 1; // 1 minuto por defecto si el valor es inválido
+            const delayInMs = delayInMinutes * 60 * 1000;
+            
+            console.log(`[CALIFICACIÓN] Programando mensaje de cierre para el chat ${chatId} (${departmentName}) en ${delayInMinutes} min.`);
+    
+            setTimeout(async () => {
+                try {
+                    // Doble chequeo: el chat sigue existiendo y está cerrado?
+                    const freshChatDoc = await db.collection('chats').doc(chatId).get();
+                    if (!freshChatDoc.exists || freshChatDoc.data().status !== 'Cerrado') {
+                        console.log(`[CALIFICACIÓN] Cancelando mensaje de cierre para ${chatId} (chat reabierto o no existe).`);
+                        return;
+                    }
+    
+                    // 5. Enviar el mensaje de cierre
+                    let sentMessage;
+                    if (platform === 'whatsapp') {
+                        sentMessage = await client.sendMessage(recipientId, { text: botSettings.closingMessage });
+                    } else if (platform === 'telegram') {
+                        // Telegraf (por ahora, solo enviamos. La captura de reacción es solo para WhatsApp)
+                        await client.telegram.sendMessage(recipientId, botSettings.closingMessage);
+                    }
+                    
+                    // 6. Guardar el ID del mensaje de calificación (solo para WhatsApp)
+                    if (platform === 'whatsapp' && sentMessage) {
+                        await db.collection('chats').doc(chatId).update({
+                            ratingMessageId: sentMessage.key.id // Guardamos el ID del mensaje que espera reacción
+                        });
+                    }
+                    
+                    console.log(`[CALIFICACIÓN] Mensaje de cierre enviado al chat ${chatId}`);
+    
+                } catch (error) {
+                    console.error(`[CALIFICACIÓN] Error al enviar mensaje de cierre (timeout) al chat ${chatId}:`, error);
+                }
+            }, delayInMs);
     
         } catch (error) {
-            console.error(`[OUTBOUND] Error crítico al iniciar nuevo chat:`, error);
-            socket.emit('envio_fallido', { error: `Error del servidor: ${error.message}` });
+            console.error(`[CALIFICACIÓN] Error general en 'solicitar_calificacion' para el chat ${chatId}:`, error);
+        }
+    });
+	
+	// Archivo: server.js -> Reemplaza este listener completo
+
+    socket.on('guardar_nota_interna', async (data) => {
+        const { chatId, agentEmail, noteText } = data;
+
+        if (!chatId || !agentEmail || !noteText || !noteText.trim()) {
+            console.warn(`[NOTA INTERNA] Datos inválidos recibidos para guardar nota.`);
+            socket.emit('nota_interna_error', { chatId, error: 'Datos incompletos.' });
+            return;
+        }
+
+        try {
+            // --- Extracción de Menciones (Sin cambios) ---
+            const mentionRegex = /@([\w\s-]+)/g;
+            const mentionedNames = [];
+            let match;
+            while ((match = mentionRegex.exec(noteText)) !== null) {
+                mentionedNames.push(match[1].trim());
+            }
+
+            let mentionedEmails = [];
+            if (mentionedNames.length > 0) {
+                const agentsSnapshot = await db.collection('agents').get();
+                const agentsData = agentsSnapshot.docs.map(doc => doc.data());
+                mentionedEmails = mentionedNames
+                    .map(name => {
+                        const foundAgent = agentsData.find(agent => agent.name === name);
+                        return foundAgent ? foundAgent.email : null;
+                    })
+                    .filter(email => email !== null && email !== agentEmail); // Filtra nulos y auto-menciones
+            }
+            // --- Fin Extracción de Menciones ---
+
+
+            // Referencia a la subcolección de notas internas
+            const notesRef = db.collection('chats').doc(chatId).collection('internal_notes');
+
+            // Añadimos la nueva nota con el campo 'mentions'
+            const newNoteData = {
+                text: noteText.trim(),
+                agentEmail: agentEmail,
+                timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                readBy: [agentEmail], // El autor la marca como leída automáticamente
+                mentions: mentionedEmails // Array de emails mencionados
+            };
+
+            const noteDocRef = await notesRef.add(newNoteData); // Guardamos la referencia para obtener el ID si es necesario
+
+            console.log(`[NOTA INTERNA] Nota guardada (${noteDocRef.id}) para chat ${chatId} por ${agentEmail}. Menciones: ${mentionedEmails.join(', ')}`);
+            socket.emit('nota_interna_guardada', { chatId }); // Confirmación
+
+            // --- INICIO: Lógica para Crear Notificaciones ---
+            if (mentionedEmails.length > 0) {
+                console.log(`[NOTIFICACIÓN] Creando notificaciones para: ${mentionedEmails.join(', ')} sobre nota en chat ${chatId}`);
+
+                // Obtenemos el nombre del contacto para el texto de la notificación (opcional pero útil)
+                let contactName = 'un chat';
+                try {
+                    const chatDoc = await db.collection('chats').doc(chatId).get();
+                    if (chatDoc.exists) {
+                        contactName = chatDoc.data().contactName || contactName;
+                    }
+                } catch (err) {
+                    console.warn(`[NOTIFICACIÓN] No se pudo obtener el nombre del contacto para el chat ${chatId}`);
+                }
+
+                // Usamos un batch write para crear todas las notificaciones eficientemente
+                const batch = db.batch();
+                const notificationsRef = db.collection('notifications'); // Colección principal para notificaciones
+
+                mentionedEmails.forEach(recipientEmail => {
+                    const notificationDocRef = notificationsRef.doc(); // Firestore genera un ID automático
+                    batch.set(notificationDocRef, {
+                        recipientEmail: recipientEmail, // Quién recibe la notificación
+                        senderEmail: agentEmail,        // Quién envió la nota
+                        chatId: chatId,                 // En qué chat ocurrió
+                        chatContactName: contactName,   // Nombre del cliente
+                        noteId: noteDocRef.id,          // ID de la nota interna específica
+                        type: 'mention',                // Tipo de notificación
+                        text: `te mencionó en una nota interna en el chat de ${contactName}.`, // Texto a mostrar
+                        timestamp: admin.firestore.FieldValue.serverTimestamp(), // Hora de creación
+                        read: false                     // Estado inicial: no leída
+                    });
+                });
+
+                // Ejecutamos el batch
+                await batch.commit();
+                console.log(`[NOTIFICACIÓN] ${mentionedEmails.length} notificaciones creadas.`);
+            }
+            // --- FIN: Lógica para Crear Notificaciones ---
+
+        } catch (error) {
+            console.error(`[NOTA INTERNA] Error al guardar nota y/o crear notificaciones para chat ${chatId}:`, error);
+            socket.emit('nota_interna_error', { chatId, error: 'Error del servidor al guardar la nota.' });
         }
     });
 
-    socket.on('solicitar_calificacion', async ({ chatId }) => { /* ... Tu lógica de calificación ... */ });
+	socket.on('marcar_notas_leidas', async (data) => {
+        const { chatId, agentEmail, noteIds } = data;
+
+        if (!chatId || !agentEmail || !Array.isArray(noteIds) || noteIds.length === 0) {
+            console.warn(`[NOTA INTERNA LEÍDA] Datos inválidos recibidos para marcar notas.`);
+            return;
+        }
+
+        try {
+            // Referencia a la subcolección
+            const notesRef = db.collection('chats').doc(chatId).collection('internal_notes');
+            
+            // Usamos un batch write para actualizar múltiples documentos eficientemente
+            const batch = db.batch();
+
+            noteIds.forEach(noteId => {
+                const noteDocRef = notesRef.doc(noteId);
+                // Usamos arrayUnion para añadir el email al array 'readBy'
+                // Si el email ya existe, arrayUnion no hace nada (idempotente)
+                batch.update(noteDocRef, {
+                    readBy: admin.firestore.FieldValue.arrayUnion(agentEmail)
+                });
+            });
+
+            // Ejecutamos el batch
+            await batch.commit();
+            console.log(`[NOTA INTERNA LEÍDA] ${noteIds.length} notas marcadas como leídas por ${agentEmail} en chat ${chatId}.`);
+
+        } catch (error) {
+            console.error(`[NOTA INTERNA LEÍDA] Error al marcar notas como leídas para chat ${chatId}:`, error);
+            // Podríamos emitir un error al cliente si es crítico
+            // socket.emit('marcar_leidas_error', { chatId, error: 'Error del servidor.' });
+        }
+    });
+
     socket.on('disconnect', () => console.log(`Usuario frontend desconectado: ${socket.id}`));
 });
 
